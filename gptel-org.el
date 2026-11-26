@@ -190,6 +190,18 @@ on a line by themselves, separated from surrounding text."
           (const :tag "Standalone links" gptel-org--link-standalone-p)
           (function :tag "Function")))
 
+(defcustom gptel-org-convert-tables t
+  "Whether to convert Markdown tables to Org tables in responses.
+
+This only affects responses in Org buffers that are converted from
+Markdown, see `gptel-org-convert-response'.
+
+Markdown table delimiter rows are deleted and rows that are
+missing their outer pipes get them, so that the table is valid Org
+table syntax.  The columns are not aligned, see `org-table-align'."
+  :group 'gptel
+  :type 'boolean)
+
 (defconst gptel-org--link-regex
   (concat "\\(?:" org-link-bracket-re "\\|" org-link-angle-re "\\)")
   "Link regex for `gptel-mode' in Org mode.")
@@ -698,6 +710,164 @@ send in queries.  (See `gptel--num-messages-to-send' for the last one.)"
 
 
 ;;; Transforming responses
+;; Markdown tables.  A Markdown pipe table is never valid Org table text: the
+;; delimiter row (|---|:--:|) is a junk row in Org, and rows are only required
+;; to have outer pipes in Org.  The converters below delete the delimiter row
+;; and add the missing outer pipes.  They do not align columns -- `org-table-align'
+;; is the user's business -- so the result is only *valid* Org table text.
+;;
+;; Both converters share one line-oriented pass,
+;; `gptel-org--convert-table-lines', and the same deliberately textual
+;; heuristics: a line that starts with a pipe is a table row, and a line that
+;; merely contains a pipe is a row only when it adjoins the rest of a table.
+;; Anything else is prose that happens to contain a pipe, and is left alone.
+
+(defun gptel-org--table-delimiter-row-p (line)
+  "Return non-nil if LINE is a Markdown table delimiter row.
+
+A delimiter row contains nothing but pipes, hyphens, colons and
+whitespace, with at least one pipe and one hyphen, e.g.
+\"|---|---|\" or \"| :--- | ---: |\"."
+  (and (string-match-p "\\`[ \t|:-]+\\'" line)
+       (string-match-p "|" line)
+       (string-match-p "-" line)))
+
+(defun gptel-org--table-row-p (line)
+  "Return non-nil if LINE starts like a table row.
+
+That is, its first non-blank character is a pipe."
+  (string-match-p "\\`[ \t]*|" line))
+
+(defun gptel-org--table-bare-row-p (line)
+  "Return non-nil if LINE could be a table row without outer pipes.
+
+That is, it contains a pipe but does not start with one.  Prose
+that mentions a pipe looks the same, so callers must check that
+the line belongs to a table before converting it."
+  (and (not (gptel-org--table-row-p line))
+       (string-match-p "|" line)))
+
+(defun gptel-org--src-block-line-p (line)
+  "Return non-nil if LINE opens or closes a source block.
+
+Markdown fences, and the Org block lines that
+`gptel--replace-source-marker' turns them into, are both recognized."
+  (string-match-p "\\`[ \t]*\\(?:```\\|#\\+\\(?:begin\\|end\\)_\\)" line))
+
+(defun gptel-org--in-src-block-p (pos)
+  "Return non-nil if POS is inside a source block.
+
+The fences are counted from the beginning of the buffer, so the
+answer does not depend on how much of the buffer the caller has
+already seen.  This costs one regexp search per fence, not one per
+line."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((fences 0))
+      (while (re-search-forward "^[ \t]*\\(?:```\\|#\\+\\(?:begin\\|end\\)_\\)" pos t)
+        (setq fences (1+ fences)))
+      (cl-oddp fences))))
+
+(defun gptel-org--table-ends-at-p (pos)
+  "Return non-nil if the line before POS's line is part of a table.
+
+A table row here means a line that starts with a pipe or a
+Markdown delimiter row, so that a row without outer pipes is
+recognized as such when it follows the rest of its table."
+  (save-excursion
+    (goto-char pos)
+    (when (> (line-beginning-position) (point-min))
+      (forward-line -1)
+      (let ((line (buffer-substring-no-properties
+                   (line-beginning-position) (line-end-position))))
+        (or (gptel-org--table-row-p line)
+            (gptel-org--table-delimiter-row-p line))))))
+
+(defun gptel-org--table-normalize-row (beg end)
+  "Add the outer pipes missing from the table row between BEG and END.
+
+BEG and END delimit the text of the row, without its newline."
+  (save-excursion
+    (goto-char end)
+    (skip-chars-backward " \t" beg)
+    (unless (eq (char-before) ?|) (insert " |"))
+    (goto-char beg)
+    (skip-chars-forward " \t" end)
+    (unless (eq (char-after) ?|) (insert "| "))))
+
+(defun gptel-org--convert-table-lines (start &optional final)
+  "Convert the Markdown table lines between START and `point-max'.
+
+Delimiter rows are deleted and rows that lack outer pipes get
+them.  Source blocks are skipped, and a line that merely contains
+a pipe is converted only when it adjoins a table, so prose
+containing pipes is left alone.  The columns are not aligned, see
+`org-table-align'.
+
+Only complete lines are converted, since a streaming converter
+cannot take back what it has already emitted: the last line is
+converted only when FINAL is non-nil, and is otherwise returned as
+the position from which output must be withheld until the rest of
+it arrives.
+
+The state this needs -- whether we are inside a source block, and
+whether the preceding line is part of a table -- is read from the
+buffer at START rather than carried between calls, so converting a
+region twice is harmless."
+  (let ((in-src (gptel-org--in-src-block-p start))
+        (prev-table (gptel-org--table-ends-at-p start))
+        (actions nil)
+        hold)
+    (save-excursion
+      (goto-char start)
+      (unless (bolp) (forward-line 1))  ;part of this line was already emitted
+      (let ((end (point-max)))
+        (while (if final (< (point) end) (< (line-end-position) end))
+          (let* ((beg (line-beginning-position))
+                 (eol (line-end-position))
+                 (line (buffer-substring-no-properties beg eol))
+                 (next (if (< eol end)
+                           (save-excursion
+                             (forward-line 1)
+                             (buffer-substring-no-properties
+                              (line-beginning-position) (line-end-position)))
+                         "")))
+            (cond
+             ((gptel-org--src-block-line-p line)
+              (setq in-src (not in-src) prev-table nil))
+             (in-src (setq prev-table nil))
+             ((gptel-org--table-delimiter-row-p line)
+              (push (list 'delete beg eol) actions)
+              (setq prev-table t))
+             ((gptel-org--table-row-p line)
+              (push (list 'row beg eol) actions)
+              (setq prev-table t))
+             ;; A row without outer pipes is only recognizable next to the rest
+             ;; of a table: it continues one, or it heads one whose delimiter
+             ;; row follows it.
+             ((and (gptel-org--table-bare-row-p line)
+                   (or prev-table (gptel-org--table-delimiter-row-p next)))
+              (push (list 'row beg eol) actions)
+              (setq prev-table t))
+             (t (setq prev-table nil))))
+          (forward-line 1))
+        ;; A trailing partial line that already has a pipe in it can still turn
+        ;; out to be a table row or a delimiter row: hold it back.
+        (setq hold (and (not final)
+                        (string-match-p "|" (buffer-substring-no-properties
+                                             (point) end)))))
+      ;; Apply the edits bottom-up so that the recorded positions stay valid.
+      (dolist (action actions)
+        (pcase-let ((`(,kind ,beg ,end) action))
+          (if (eq kind 'delete)
+              (delete-region beg (min (point-max) (1+ end)))
+            (gptel-org--table-normalize-row beg end))))
+      ;; The edits above moved the withheld line: it is now the last one.
+      (when hold
+        (setq hold (save-excursion (goto-char (point-max))
+                                   (line-beginning-position)))))
+    hold))
+
 ;;;###autoload
 (defun gptel--convert-markdown->org (str)
   "Convert string STR from markdown to org markup.
@@ -757,6 +927,8 @@ elements."
                  (looking-at "\\(?:$\\|\\`\\)\n\\*[[:space:]]")))
            ;; Bullet point, replace with hyphen
            (delete-char -1) (insert "-"))))))
+    (when gptel-org-convert-tables
+      (gptel-org--convert-table-lines (point-min) 'final))
     (buffer-string)))
 
 (defun gptel--replace-source-marker (num-ticks &optional end)
@@ -892,6 +1064,15 @@ cleaning up after."
                              (looking-at "\\(?:$\\|\\`\\)\n\\*[[:space:]]"))
                          ;; Bullet point, replace with hyphen
                          (forward-char (if (bobp) 1 2)) (delete-char -1) (insert "-"))))))))))
+          ;; Convert the table lines that are complete, holding back an
+          ;; incomplete one.  This must run after the scan above, which may
+          ;; have set `noop-p' for an earlier construct.
+          (when gptel-org-convert-tables
+            (when-let* ((hold (gptel-org--convert-table-lines
+                               (or (marker-position start-pt) (point-min)))))
+              (set-marker start-pt
+                          (if noop-p (min hold (marker-position start-pt)) hold))
+              (setq noop-p t)))
           (if noop-p
               (buffer-substring (point) start-pt)
             (prog1 (buffer-substring (point) (point-max))
