@@ -54,6 +54,8 @@
 (declare-function json-read "json" ())
 (defvar json-object-type)
 (defvar inhibit-interaction)          ;Emacs 27+
+(defvar y-or-n-p-use-read-key)        ;Emacs 27+
+(defvar read-char-choice-use-read-key) ;Emacs 27+
 
 (declare-function gptel--stream-convert-markdown->org "gptel-org")
 (declare-function gptel--convert-markdown->org "gptel-org")
@@ -2063,10 +2065,15 @@ request waiting in the TOOL state forever.
 
 If `gptel-tool-call-inhibit-interaction' is non-nil, interaction and
 dialog boxes are disabled for the duration of the call, so that a tool
-cannot open a prompt that nothing can answer."
+cannot open a prompt that nothing can answer.  `read-key' is exempt
+from `inhibit-interaction', so the options that make `y-or-n-p' and
+`read-char-choice' read a raw key instead of prompting are turned off
+as well: with them on, both would block in `read-key' forever."
   (let ((inhibit-interaction (or inhibit-interaction
                                   gptel-tool-call-inhibit-interaction))
-        (use-dialog-box nil))
+        (use-dialog-box nil)
+        (y-or-n-p-use-read-key nil)
+        (read-char-choice-use-read-key nil))
     (condition-case err
         (if (gptel-tool-async tool-spec)
             (apply (gptel-tool-function tool-spec) deliver arg-values)
