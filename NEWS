@@ -44,6 +44,19 @@
 
 ** New features and UI changes
 
+- New option ~gptel-autosave~ to save a chat buffer after each
+  response: nil (never), ~file~ (save the buffer's visited file) or
+  ~temp-file~ (save a copy to a temporary file; not implemented yet).
+
+- New option ~gptel-tool-call-prompt-policy~, controlling the prompts
+  a tool function may raise while it runs -- the confirmation a tool
+  like ~write-file~ asks for, for example.  The default, ~approve~,
+  answers them the way a non-interactive caller would, since the tool
+  call has already been confirmed through
+  ~gptel-confirm-tool-calls~.  The other values are ~inhibit~, which
+  reports the prompt to the LLM as the tool result instead, and ~ask~,
+  which leaves prompts alone.
+
 - gptel can now save and restore additional per-conversation state in
   Org buffers with the new abnormal hooks
   ~gptel-org-save-state-functions~ and

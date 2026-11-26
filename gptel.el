@@ -255,6 +255,45 @@ at the time of the request."
 
 (add-hook 'gptel-post-response-functions 'pulse-momentary-highlight-region 70)
 
+(defcustom gptel-autosave nil
+  "Whether to save the chat buffer after each response is received.
+
+The value can be
+
+  nil        Never save automatically.
+
+  file       Save the buffer's visited file, if it has one.  A chat
+             buffer that visits no file, such as a scratch gptel
+             buffer, is left alone.
+
+  temp-file  Save a copy to a temporary file instead of to the
+             buffer's file, backing up the conversation without
+             touching the user's file.  Not implemented yet.
+
+Only a completed response triggers a save; a failed or aborted
+request does not."
+  :type '(choice
+          (const :tag "Never save" nil)
+          (const :tag "Save the buffer's file" file)
+          (const :tag "Save to a temporary file" temp-file))
+  :group 'gptel)
+
+(defun gptel--autosave ()
+  "Save the current gptel buffer, as `gptel-autosave' says.
+
+This runs after a response has been inserted, with the buffer that
+received it current."
+  (pcase gptel-autosave
+    ('file
+     (when (and buffer-file-name (buffer-modified-p))
+       (save-buffer)))
+    ('temp-file
+     ;; TODO: Write the buffer to a temporary file and keep the previous
+     ;; copy around, without touching `buffer-file-name'.  Until this is
+     ;; implemented, ask for more than we can do rather than silently
+     ;; saving the user's file.
+     (message "gptel-autosave: saving to a temporary file is not implemented yet"))))
+
 (defcustom gptel-post-stream-hook nil
   "Hook run after each insertion of the LLM's streaming response.
 
@@ -1439,7 +1478,13 @@ No state transition here since that's handled by the process sentinels."
         (mapc (lambda (f) (funcall f info)) (plist-get info :post))
         (run-hook-with-args
          'gptel-post-response-functions
-         (marker-position start-marker) (marker-position tracking-marker))))))
+         (marker-position start-marker) (marker-position tracking-marker))))
+    ;; Only a completed response is saved: `gptel--handle-error' and
+    ;; `gptel--handle-abort' run the hook above too, and saving half a
+    ;; conversation there is not what `gptel-autosave' is for.
+    (with-current-buffer gptel-buffer
+      (when (and (buffer-local-value 'gptel-mode gptel-buffer) gptel-autosave)
+        (gptel--autosave)))))
 
 (defun gptel--handle-error (fsm)
   "Check for errors in request state FSM.
