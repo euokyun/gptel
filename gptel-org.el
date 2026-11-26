@@ -974,7 +974,7 @@ This is intended for use in the markdown to org stream converter."
       (insert "="))))
 
 ;;;###autoload
-(defun gptel--stream-convert-markdown->org (start-marker)
+(defun gptel--stream-convert-markdown->org (start-marker &optional info)
   "Return a Markdown to Org converter.
 
 This function parses a stream of Markdown text to Org
@@ -982,22 +982,43 @@ continuously when it is called with successive chunks of the
 text stream.
 
 START-MARKER is used to identify the corresponding process when
-cleaning up after."
+cleaning up after.
+
+INFO, if non-nil, is the info plist of the request being streamed.
+The cleanup function for the converter's temporary buffer is added
+to its `:post' list, so that the buffer and the hook entry are
+freed when the request reaches a terminal state, even if no
+response was ever inserted."
   (letrec ((in-src-block nil)           ;explicit nil to address BUG #183
            (in-org-src-block nil)
            (temp-buf ; NOTE: Switch to `generate-new-buffer' after we drop Emacs 27.1
             (gptel--temp-buffer " *gptel-temp*"))
            (start-pt (make-marker))
            (ticks-total 0)      ;MAYBE should we let-bind case-fold-search here?
+           (cleaned nil)
            (cleanup-fn
-            (lambda (beg _)
-              (when (and (equal beg (marker-position start-marker))
-                         (eq (current-buffer) (marker-buffer start-marker)))
+            (lambda (&rest args)
+              ;; Called with (INFO) from the request's `:post' functions, and
+              ;; with (BEG END) from `gptel-post-response-functions', where it
+              ;; must not touch another request's state.
+              (when (and (not cleaned)
+                         (or (not (integerp (car args)))
+                             (and (equal (car args) (marker-position start-marker))
+                                  (eq (current-buffer) (marker-buffer start-marker)))))
+                (setq cleaned t)
                 (when (buffer-live-p (get-buffer temp-buf))
-                  (set-marker start-pt nil)
                   (kill-buffer temp-buf))
+                (set-marker start-pt nil)
                 (remove-hook 'gptel-post-response-functions cleanup-fn)))))
     (add-hook 'gptel-post-response-functions cleanup-fn)
+    (when info
+      (if (plist-member info :post)
+          (plist-put info :post (cons cleanup-fn (plist-get info :post)))
+        ;; Extend INFO in place: the caller keeps the head of the plist, so a
+        ;; new one returned by `plist-put' would be thrown away.
+        (let ((tail info))
+          (while (cdr tail) (setq tail (cdr tail)))
+          (setcdr tail (list :post (list cleanup-fn))))))
     (lambda (str)
       (let ((noop-p) (ticks 0))
         (with-current-buffer (get-buffer temp-buf)

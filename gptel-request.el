@@ -3109,19 +3109,25 @@ the response is inserted into the current buffer after point."
       (process-send-eof process)
       (if (plist-get info :uuid)        ;not the first run, set only the uuid
           (plist-put info :uuid uuid)
-        (setf (gptel-fsm-info fsm)      ;fist run, set all process parameters
-              (nconc (list :uuid uuid
-                           :transformer
+        ;; First run, set all process parameters.  The plist is built before the
+        ;; transformer is created so that the streaming converter, which frees
+        ;; its temporary buffer from the request's :post functions, receives the
+        ;; final plist.
+        (let ((new-info (nconc (list :uuid uuid)
+                               (unless (plist-get info :callback)
+                                 (list :callback
+                                       (if stream
+                                           #'gptel-curl--stream-insert-response
+                                         #'gptel--insert-response)))
+                               info)))
+          (setq new-info
+                (plist-put new-info :transformer
                            (when (with-current-buffer (plist-get info :buffer)
                                    (and (derived-mode-p 'org-mode)
                                         gptel-org-convert-response))
                              (gptel--stream-convert-markdown->org
-                              (plist-get info :position))))
-                     (unless (plist-get info :callback)
-                       (list :callback (if stream
-                                           #'gptel-curl--stream-insert-response
-                                         #'gptel--insert-response)))
-                     info)))
+                              (plist-get info :position) new-info))))
+          (setf (gptel-fsm-info fsm) new-info)))
       (if stream
           (progn (set-process-sentinel process #'gptel-curl--stream-cleanup)
                  (set-process-filter process #'gptel-curl--stream-filter))
