@@ -41,6 +41,7 @@
 (defvar gptel-max-tokens)
 (defvar gptel--link-type-cache)
 (defvar gptel--preset)
+(defvar so-long-action)                 ;so-long.el, Emacs 27+
 
 (defvar org-link-angle-re)
 (defvar org-link-bracket-re)
@@ -59,6 +60,9 @@
 (declare-function gptel--get-buffer-bounds "gptel")
 (declare-function gptel--valid-bounds "gptel")
 (declare-function gptel--restore-props "gptel")
+(declare-function gptel-mode "gptel")
+(declare-function so-long "so-long" (&optional action))
+(declare-function so-long-revert "so-long" ())
 (declare-function org-entry-get "org")
 (declare-function org-entry-put "org")
 (declare-function org-with-wide-buffer "org-macs" nil t)
@@ -261,6 +265,99 @@ functions are demoted, so they cannot break the restoration of gptel's
 own state."
   :group 'gptel
   :type 'hook)
+
+(defcustom gptel-org-auto-enable nil
+  "Whether to turn on `gptel-mode' in a gptel session file when it is visited.
+
+gptel saves the state of a session in the Org file it was run in, but
+it does not restore that state by itself when the file is visited
+again: the state is restored by turning on `gptel-mode', as the
+docstring of `gptel--save-state' says, so until now the only way to
+resume a saved conversation was to put a file-local `eval' form in the
+first line of the file:
+
+  -*- eval: (gptel-mode 1) -*-
+
+That is harmful for two reasons.  It changes the length of the first
+line, and every buffer position stored in the file -- the response
+bounds in the `GPTEL_BOUNDS' property -- is an absolute position, so
+they all shift and end up pointing at the wrong text.  And a
+file-local `eval' form runs arbitrary Elisp in any file that carries
+it whenever `enable-local-variables' allows it, so an Org file from an
+untrusted source can run code on your machine.
+
+When this option is non-nil, `gptel-org--find-file-setup' turns on
+`gptel-mode' in a visited file that already contains gptel session
+state.  The file itself is never modified.  This happens after the
+file has been re-read with the right coding system and after `so-long'
+has been dealt with, see `gptel-org-restore-coding-system' and
+`gptel-org-so-long-action'.
+
+The default is nil because turning on a minor mode as a side effect of
+visiting a file is a behavior change that should be opted into."
+  :group 'gptel
+  :type 'boolean)
+
+(defcustom gptel-org-restore-coding-system 'utf-8
+  "Coding system to re-read a gptel session file with, or nil to disable.
+
+gptel writes session files as UTF-8, but Emacs does not always read
+them back that way.  A single NUL byte anywhere in the file -- tool
+output, a base64-encoded attachment, a model reply -- makes Emacs guess
+`no-conversion', and then one byte of the file becomes one character of
+the buffer.  The text is mangled, and worse, the response bounds gptel
+stores in `GPTEL_BOUNDS' are character positions taken when the file
+was written.  They no longer match the buffer, so restoring the session
+either signals `args-out-of-range' or puts gptel's text properties on
+the wrong text.
+
+Re-reading the file with this coding system restores the
+one-character-per-character mapping without editing any text, so no
+stored position moves.  Only buffers that contain gptel session state
+are re-read: a genuine binary file keeps whatever coding system Emacs
+picked for it.
+
+Set this to nil to leave the coding system of session files alone."
+  :group 'gptel
+  :type '(choice (coding-system :tag "Coding system" :value utf-8)
+                 (const :tag "Do not re-read session files" nil)))
+
+(defcustom gptel-org-so-long-action 'so-long-minor-mode
+  "The `so-long' action for gptel session buffers, or nil to leave it alone.
+
+`so-long' is part of Emacs since 27.1 and is meant to keep Emacs
+responsive in buffers with very long lines.  Session files routinely
+have them: tool output and base64-encoded attachments are single lines
+of tens of thousands of characters.  The default `so-long' action,
+`so-long-mode', replaces the major mode, and changing the major mode
+kills all local variables, so `gptel-mode' is turned off and there is
+no session left to restore.
+
+With the default value, `so-long-minor-mode', a session buffer keeps
+its major mode and its local variables, and `so-long' still applies its
+performance measures: the variable overrides of
+`so-long-variable-overrides' (line truncation, no bidirectional
+reordering), the minor modes of `so-long-minor-modes' are turned off,
+and fontification is disabled.  The value is a key of
+`so-long-action-alist'; it is also assigned to `so-long-action'
+locally in session buffers, so that a later automatic invocation of
+`so-long' uses it as well.  (`so-long-action' is read when `so-long'
+is called and is documented as suitable for a file- or dir-local
+value, so setting it locally is supported.)
+
+Note that `so-long' also makes the buffer read-only by default (see
+`so-long-variable-overrides'), so a session buffer that `so-long' has
+acted on is read-only until `so-long-revert' is called.
+
+Set this to nil to leave `so-long' entirely alone, including not
+undoing anything if it has already replaced the major mode of a
+session buffer."
+  :group 'gptel
+  :type '(choice
+          (const :tag "Keep the major mode (so-long-minor-mode)"
+                 so-long-minor-mode)
+          (const :tag "Leave so-long alone" nil)
+          (symbol :tag "Another so-long action")))
 
 (defconst gptel-org--link-regex
   (concat "\\(?:" org-link-bracket-re "\\|" org-link-angle-re "\\)")
@@ -617,18 +714,68 @@ ARGS are the original function call arguments."
 
 
 ;;; Saving and restoring state
+(defconst gptel-org--state-properties
+  '("GPTEL_BOUNDS" "GPTEL_PRESET" "GPTEL_SYSTEM" "GPTEL_BACKEND" "GPTEL_MODEL"
+    "GPTEL_TEMPERATURE" "GPTEL_MAX_TOKENS" "GPTEL_NUM_MESSAGES_TO_SEND"
+    "GPTEL_TOOLS")
+  "Org properties that mark a buffer as holding gptel state.
+
+These are the properties written by `gptel-org-set-properties' and
+`gptel-org--save-state'.  The list is used both for looking properties
+up with `org-entry-get' (see `gptel-org--properties-p') and for
+searching the text of the buffer (see `gptel-org-session-p' and
+`gptel-org--state-property-regexp'), so the two ways of asking whether
+a buffer holds gptel state always agree.")
+
+(defconst gptel-org--state-property-regexp
+  (concat "^[ \t]*:" (regexp-opt gptel-org--state-properties) ":")
+  "Regexp matching an Org property line that names gptel state.
+
+See `gptel-org--state-properties' and `gptel-org-session-p'.")
+
+(defun gptel-org-session-p (&optional buffer)
+  "Return non-nil if BUFFER (default: current buffer) holds gptel session state.
+
+A buffer holds gptel session state if it visits a file, and that file
+contains the Org properties written by `gptel-org--save-state' (see
+`gptel-org--state-properties'), which include the response bounds in
+`GPTEL_BOUNDS'.
+
+Unlike `gptel-org--properties-p', which asks Org for an entry property
+and therefore needs `org-mode' and an actual property drawer, this
+looks at the text of the buffer, so it works in any major mode.  That
+is the point of it: it is called from `find-file-hook', where the major
+mode may already have been replaced by something else -- typically
+`so-long-mode', which `global-so-long-mode' can install before
+`find-file-hook' runs at all.
+
+It does not move point, does not depend on the major mode, and only
+searches the first few kilobytes of the buffer, where the property
+drawer is written."
+  (with-current-buffer (or buffer (current-buffer))
+    (and buffer-file-name
+         (save-restriction
+           (widen)
+           (save-excursion
+             (save-match-data
+               (goto-char (point-min))
+               ;; 4kB is plenty: gptel writes the drawer at `point-min'.
+               (re-search-forward gptel-org--state-property-regexp
+                                  (min (point-max) (+ (point-min) 4096))
+                                  t)))))))
+
 (defun gptel-org--properties-p (&optional pt)
   "Return non-nil if gptel state is stored as properties under PT.
 
 PT defaults to the current position.  The properties checked are the
 ones written by `gptel-org-set-properties' and
-`gptel-org--save-state'."
+`gptel-org--save-state', see `gptel-org--state-properties'.
+
+This needs `org-mode'; see `gptel-org-session-p' for a check that does
+not."
   (let ((pt (or pt (point))))
-    (or (org-entry-get pt "GPTEL_BOUNDS" 'selective)
-        (cl-some (lambda (prop) (org-entry-get pt prop 'selective))
-                 '("GPTEL_PRESET" "GPTEL_SYSTEM" "GPTEL_BACKEND" "GPTEL_MODEL"
-                   "GPTEL_TEMPERATURE" "GPTEL_MAX_TOKENS"
-                   "GPTEL_NUM_MESSAGES_TO_SEND" "GPTEL_TOOLS")))))
+    (cl-some (lambda (prop) (org-entry-get pt prop 'selective))
+             gptel-org--state-properties)))
 
 (defun gptel-org--entry-properties (&optional pt)
   "Find gptel configuration properties stored at PT."
@@ -817,6 +964,119 @@ settle after %d passes, they may be off"
         (with-demoted-errors "gptel-org-save-state-functions: %S"
           (funcall func))
         nil)))))                        ;always return nil so the rest run
+
+
+
+;;; Visiting a saved session
+;; The functions below each deal with one thing that can keep a visited session
+;; file from being restored: the coding system Emacs guessed, `so-long'
+;; replacing the major mode, and `gptel-mode' not being turned on.  They are
+;; called, in that order, from `gptel-org--find-file-setup'.
+
+(defun gptel-org--restore-coding ()
+  "Re-read the current buffer if Emacs guessed a non-text coding system.
+
+Session files are UTF-8, but a NUL byte in one makes Emacs read it with
+a raw-text coding system (`no-conversion', `binary' or `raw-text'), one
+byte per character, and then the response bounds stored in the file are
+no longer character positions in the buffer.  Such a file is re-read
+with `gptel-org-restore-coding-system'.  See that option for the
+details.
+
+Only buffers that hold gptel session state are touched, so a genuinely
+binary file keeps its raw-text reading."
+  (when (and gptel-org-restore-coding-system
+             buffer-file-coding-system
+             (memq (coding-system-type buffer-file-coding-system)
+                   '(raw-text undecided))
+             (gptel-org-session-p))
+    ;; FORCE is non-nil so that the end-of-line convention comes from the file
+    ;; as well, instead of from the (wrong) previous guess.
+    ;;
+    ;; Note that FORCE is *not* NOCONFIRM: `revert-buffer-with-coding-system'
+    ;; calls `revert-buffer' with no arguments, which asks for confirmation
+    ;; unless the file matches `revert-without-query'.  We are visiting a file
+    ;; that is unmodified by definition, and a prompt in the middle of
+    ;; `find-file-hook' would be both surprising and useless, so match
+    ;; everything here.
+    (let ((revert-without-query '("")))
+      (revert-buffer-with-coding-system gptel-org-restore-coding-system t))))
+
+(defun gptel-org--so-long-setup ()
+  "Keep `so-long' from replacing the major mode of the current buffer.
+
+Does nothing unless `gptel-org-so-long-action' is non-nil and `so-long'
+is available.  See that option for what the problem is and for the
+choice of action.
+
+Two separate things can be needed, and both use only the public API
+of `so-long':
+
+- If `so-long' has already acted and replaced the major mode with
+  `so-long-mode', the change is undone with `so-long-revert', which
+  restores the original major mode, its minor modes and the overridden
+  variables, and leaves `so-long-revert' usable afterwards.  The
+  configured action is then applied with `so-long', which reverts the
+  old action first if one is active and sets `so-long-function' and
+  `so-long-revert-function' from the action it is given.
+
+- Either way, the action is then recorded in the buffer-local value of
+  `so-long-action', so a later automatic invocation of `so-long' in this
+  buffer uses it too.  This has to happen last: reverting to the
+  original major mode runs that mode, which kills all local variables,
+  so a buffer-local `so-long-action' set earlier would not survive."
+  (when (and gptel-org-so-long-action (require 'so-long nil t))
+    (when (eq major-mode 'so-long-mode)
+      (so-long-revert)
+      (so-long gptel-org-so-long-action))
+    (setq-local so-long-action gptel-org-so-long-action)))
+
+(defvar gptel-org--in-find-file-setup nil
+  "Non-nil while `gptel-org--find-file-setup' is running.
+
+Re-reading a session file with the right coding system runs
+`find-file-hook' again (the revert ends in `after-find-file'), so the
+setup must not repeat itself for the same visit.")
+
+(defun gptel-org--find-file-setup ()
+  "Prepare the current buffer for holding a gptel session.
+
+Runs from `find-file-hook' and does nothing in buffers that do not hold
+gptel session state (see `gptel-org-session-p').  In a session buffer
+it does three things, in this order:
+
+1. Re-reads the file if Emacs guessed the wrong coding system, see
+   `gptel-org-restore-coding-system'.  This comes first because
+   re-reading a file runs `set-auto-mode', which can re-trigger
+   `so-long' on the long lines that session files contain.
+2. Keeps `so-long' from replacing the major mode, see
+   `gptel-org-so-long-action'.
+3. Turns on `gptel-mode', which restores the saved state, if
+   `gptel-org-auto-enable' is non-nil.
+
+Errors are demoted: a broken session file must not make visiting files
+fail.
+
+This function is added to `find-file-hook' when gptel-org is loaded, so
+it applies from that point on.  gptel loads gptel-org lazily -- from
+`gptel-mode' and `gptel--restore-state' -- so a session file visited
+before gptel-org was first loaded is not set up; loading gptel-org
+eagerly instead is not worth slowing startup down for.  Enable this
+feature before visiting sessions by loading `gptel' and `gptel-org' at
+startup."
+  (unless gptel-org--in-find-file-setup
+    (let ((gptel-org--in-find-file-setup t))
+      (with-demoted-errors "gptel-org: Session setup failed: %S"
+        (when (gptel-org-session-p)
+          (gptel-org--restore-coding)
+          (gptel-org--so-long-setup)
+          (when (and gptel-org-auto-enable
+                     (not (bound-and-true-p gptel-mode))
+                     (derived-mode-p 'org-mode))
+            (require 'gptel)
+            (gptel-mode 1)))))))
+
+(add-hook 'find-file-hook #'gptel-org--find-file-setup)
 
 
 ;;; Transforming responses
