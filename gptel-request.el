@@ -1555,29 +1555,40 @@ non-nil :include slot.  See `gptel-make-tool'."
           (const :tag "Call only, no results" call)
           (const :tag "Never" nil)))
 
-(defcustom gptel-tool-call-inhibit-interaction t
-  "Whether to inhibit user interaction while a tool call runs.
+(defcustom gptel-tool-call-prompt-policy 'approve
+  "What to do about user prompts raised while a tool call runs.
 
-Tool functions are called from gptel's process filters and
-sentinels, where a prompt (`y-or-n-p', `completing-read', a dialog
-box, ...) cannot be answered: the prompt waits for input that cannot
-arrive, and since process filters bind `inhibit-quit', `C-g' does not
-break out of it either.  Emacs appears to hang.
+Tool functions run inside gptel's process callbacks, where a prompt
+(`y-or-n-p', a dialog box, ...) cannot be answered: it waits for input
+that cannot arrive, and since process filters bind `inhibit-quit',
+`C-g' does not break out of it either.  Emacs appears to hang.
 
-If this is non-nil (the default), gptel binds `inhibit-interaction'
-and disables dialog boxes while it runs a tool, so that such prompts
-signal `inhibited-interaction' instead of blocking.  The signal is
-reported to the LLM as the tool result and the request continues.
+The value can be
 
-Set this to nil to let tools prompt as usual, at the risk of hanging
-Emacs when the tool is called from gptel's own process callbacks.
+  approve  Answer the prompt the way a non-interactive caller would:
+           yes for confirmations that a tool needs in order to finish
+           its work (`y-or-n-p', `yes-or-no-p',
+           `kill-buffer--possibly-save'), nil -- meaning \"go ahead\"
+           -- for the supersession and file locking questions, the
+           first choice for the multiple-choice readers and a
+           decline for `read-key'.  Prompts it cannot answer this
+           way still signal and are reported to the LLM.
 
-Note that tool call confirmation (see `gptel-confirm-tool-calls')
-requires interaction.  When interaction is inhibited, a tool call
-that needs confirmation is not run: the error is returned as the tool
-result instead."
+  inhibit  Make every prompt signal, and report the signal to the
+           LLM as the tool result.  Use this to keep tool calls from
+           taking any decision on the user's behalf.
+
+  ask      Leave prompts alone.  A tool that prompts will hang Emacs
+           when it was called from gptel's own process callbacks.
+
+Prompting the user about the tool call itself is the job of
+`gptel-confirm-tool-calls', so answering a second, in-tool
+confirmation of the same action is redundant by default."
   :group 'gptel
-  :type 'boolean)
+  :type '(choice
+          (const :tag "Answer prompts" approve)
+          (const :tag "Signal and report to the LLM" inhibit)
+          (const :tag "Let the tool prompt" ask)))
 
 (defcustom gptel-tools nil
   "A list of tools to include with gptel requests.
@@ -2050,35 +2061,140 @@ whether or not they complete synchronously."
               "available.")
     (mapconcat #'gptel--to-string err " ")))
 
-(defun gptel--invoke-tool (tool-spec arg-values deliver)
-  "Invoke TOOL-SPEC with ARG-VALUES, delivering the outcome to DELIVER.
+(defun gptel--call-tool (tool-spec arg-values deliver)
+  "Call TOOL-SPEC with ARG-VALUES, delivering the outcome to DELIVER.
 
-DELIVER is called with the result of the tool call.  If TOOL-SPEC is
-asynchronous, see `gptel-tool-async', it is also passed to the tool
-function as its first argument, and the tool calls it when it
-finishes.  Otherwise DELIVER is called with the return value here.
+DELIVER is called with the result of the call.  For an asynchronous
+tool it is passed to the tool function as its first argument, and the
+tool calls it when it finishes; for a synchronous tool it is called
+with the return value here.
 
 A signal from the tool is passed to DELIVER as an error string instead
 of being allowed to propagate: tool functions are called from gptel's
 process filter, where a signal would abort the filter and leave the
-request waiting in the TOOL state forever.
+request waiting in the TOOL state forever."
+  (condition-case err
+      (if (gptel-tool-async tool-spec)
+          (apply (gptel-tool-function tool-spec) deliver arg-values)
+        (funcall deliver (apply (gptel-tool-function tool-spec) arg-values)))
+    (error (funcall deliver (gptel--tool-call-error-string err)))))
 
-If `gptel-tool-call-inhibit-interaction' is non-nil, interaction and
-dialog boxes are disabled for the duration of the call, so that a tool
-cannot open a prompt that nothing can answer.  `read-key' is exempt
-from `inhibit-interaction', so the options that make `y-or-n-p' and
-`read-char-choice' read a raw key instead of prompting are turned off
-as well: with them on, both would block in `read-key' forever."
-  (let ((inhibit-interaction (or inhibit-interaction
-                                  gptel-tool-call-inhibit-interaction))
+(defvar gptel--tool-call-approve-prompts nil
+  "Non-nil while a tool call runs under the `approve' prompt policy.
+
+The advice below is installed once and left in place; it does nothing
+unless this is non-nil, which `gptel--call-with-approved-prompts'
+binds for the duration of a tool call.")
+
+(defun gptel--approve-yes (orig &rest args)
+  "Answer yes instead of asking, while a tool call runs.
+Otherwise call ORIG with ARGS."
+  (if gptel--tool-call-approve-prompts t (apply orig args)))
+
+(defun gptel--approve-no (orig &rest args)
+  "Answer nil instead of asking, while a tool call runs.
+Nil means \"go ahead\" for `ask-user-about-supersession-threat' and
+`ask-user-about-lock'.  Otherwise call ORIG with ARGS."
+  (if gptel--tool-call-approve-prompts nil (apply orig args)))
+
+(defun gptel--approve-first-answer (orig prompt answers &rest args)
+  "Pick the first of ANSWERS, while a tool call runs.
+Otherwise call ORIG with PROMPT, ANSWERS and ARGS."
+  (if gptel--tool-call-approve-prompts
+      (caar answers)                    ;`read-answer' returns the long answer
+    (apply orig prompt answers args)))
+
+(defun gptel--approve-first-choice (orig prompt choices &rest args)
+  "Pick the first of CHOICES, while a tool call runs.
+Otherwise call ORIG with PROMPT, CHOICES and ARGS."
+  (if gptel--tool-call-approve-prompts
+      (car choices)                     ;`read-multiple-choice' returns the entry
+    (apply orig prompt choices args)))
+
+(defun gptel--approve-first-char (orig prompt chars &rest args)
+  "Pick the first of CHARS, while a tool call runs.
+Otherwise call ORIG with PROMPT, CHARS and ARGS."
+  (if gptel--tool-call-approve-prompts (car chars)
+    (apply orig prompt chars args)))
+
+(defun gptel--approve-decline (orig &rest args)
+  "Decline instead of reading a key, while a tool call runs.
+`read-key' honours neither `inhibit-interaction' nor `use-dialog-box',
+so leaving it alone would block.  Otherwise call ORIG with ARGS."
+  (if gptel--tool-call-approve-prompts ?n (apply orig args)))
+
+(defun gptel--install-prompt-approvals ()
+  "Install the advice used by the `approve' prompt policy.
+
+The functions involved are named in the tools themselves, so they have
+to be advised globally rather than bound locally; each advice is inert
+unless `gptel--tool-call-approve-prompts' is non-nil.  That variable is
+only bound around a tool call, which is the only time this matters.
+
+Advising a primitive makes Emacs compile a trampoline for it, which
+can fail if the native compiler is unavailable; that is not fatal, as
+a policy of `approve' degrades to `inhibit' for the functions whose
+advice could not be installed."
+  (dolist (spec '((y-or-n-p . gptel--approve-yes)
+                  (yes-or-no-p . gptel--approve-yes)
+                  (kill-buffer--possibly-save . gptel--approve-yes)
+                  (ask-user-about-supersession-threat . gptel--approve-no)
+                  (ask-user-about-lock . gptel--approve-no)
+                  (read-answer . gptel--approve-first-answer)
+                  (read-multiple-choice . gptel--approve-first-choice)
+                  (read-char-choice . gptel--approve-first-char)
+                  (read-key . gptel--approve-decline)))
+    (unless (advice-member-p (cdr spec) (car spec))
+      (with-demoted-errors "gptel-tool-call-prompt-policy: %S"
+        (advice-add (car spec) :around (cdr spec))))))
+
+(defun gptel--call-with-approved-prompts (func)
+  "Call FUNC with Emacs' confirmation prompts answered in advance.
+
+This is the `approve' setting of `gptel-tool-call-prompt-policy'.
+`y-or-n-p', `yes-or-no-p' and `kill-buffer--possibly-save' answer
+yes, which is what lets a tool create a missing directory or discard
+a buffer it modified.  `ask-user-about-supersession-threat' and
+`ask-user-about-lock' answer nil, which is how those two say \"go
+ahead\".  The multiple-choice readers pick their first choice and
+`read-key' declines.
+
+Interaction is inhibited as a backstop for prompts a tool can open
+that cannot be answered in advance, such as `read-string': those
+signal, and the signal reaches the LLM as the tool result instead of
+hanging Emacs."
+  (gptel--install-prompt-approvals)
+  (let ((gptel--tool-call-approve-prompts t)
+        (inhibit-interaction t)
         (use-dialog-box nil)
         (y-or-n-p-use-read-key nil)
         (read-char-choice-use-read-key nil))
-    (condition-case err
-        (if (gptel-tool-async tool-spec)
-            (apply (gptel-tool-function tool-spec) deliver arg-values)
-          (funcall deliver (apply (gptel-tool-function tool-spec) arg-values)))
-      (error (funcall deliver (gptel--tool-call-error-string err))))))
+    (funcall func)))
+
+(defun gptel--invoke-tool (tool-spec arg-values deliver)
+  "Invoke TOOL-SPEC with ARG-VALUES, delivering the outcome to DELIVER.
+
+DELIVER is called with the result of the tool call, see
+`gptel--call-tool'.
+
+User prompts a tool might raise are handled according to
+`gptel-tool-call-prompt-policy', which see: they are answered, made
+to signal, or left alone."
+  (pcase gptel-tool-call-prompt-policy
+    ('approve
+     (gptel--call-with-approved-prompts
+      (lambda () (gptel--call-tool tool-spec arg-values deliver))))
+    ('inhibit
+     ;; `read-key' is exempt from `inhibit-interaction', so the options that
+     ;; make `y-or-n-p' and `read-char-choice' read a raw key instead of
+     ;; prompting are turned off as well: with them on, both would block in
+     ;; `read-key' forever.
+     (let ((inhibit-interaction t)
+           (use-dialog-box nil)
+           (y-or-n-p-use-read-key nil)
+           (read-char-choice-use-read-key nil))
+       (gptel--call-tool tool-spec arg-values deliver)))
+    (_ (gptel--call-tool tool-spec arg-values deliver))))
 
 (defun gptel--handle-tool-use (fsm)
   "Run tool calls captured in FSM, and advance the state machine with the results."
