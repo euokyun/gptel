@@ -2439,16 +2439,9 @@ overlay in the query buffer."
     (delete-overlay ov))
   (message "Continuing query...")
   (cl-loop for (tool-spec arg-plist process-tool-result) in tool-calls
-           for arg-values = (gptel--map-tool-args tool-spec arg-plist)
-           do
-           (if (gptel-tool-async tool-spec)
-               (apply (gptel-tool-function tool-spec)
-                      process-tool-result arg-values)
-             (let ((result
-                    (condition-case errdata
-                        (apply (gptel-tool-function tool-spec) arg-values)
-                      (error (mapconcat #'gptel--to-string errdata " ")))))
-               (funcall process-tool-result result)))))
+           do (gptel--invoke-tool tool-spec
+                                  (gptel--map-tool-args tool-spec arg-plist)
+                                  process-tool-result)))
 
 (defun gptel--reject-tool-calls (&optional _tool-calls ov)
   "Cancel pending tool-calls.

@@ -53,6 +53,7 @@
 
 (declare-function json-read "json" ())
 (defvar json-object-type)
+(defvar inhibit-interaction)          ;Emacs 27+
 
 (declare-function gptel--stream-convert-markdown->org "gptel-org")
 (declare-function gptel--convert-markdown->org "gptel-org")
@@ -1518,6 +1519,30 @@ non-nil :include slot.  See `gptel-make-tool'."
           (const :tag "Call only, no results" call)
           (const :tag "Never" nil)))
 
+(defcustom gptel-tool-call-inhibit-interaction t
+  "Whether to inhibit user interaction while a tool call runs.
+
+Tool functions are called from gptel's process filters and
+sentinels, where a prompt (`y-or-n-p', `completing-read', a dialog
+box, ...) cannot be answered: the prompt waits for input that cannot
+arrive, and since process filters bind `inhibit-quit', `C-g' does not
+break out of it either.  Emacs appears to hang.
+
+If this is non-nil (the default), gptel binds `inhibit-interaction'
+and disables dialog boxes while it runs a tool, so that such prompts
+signal `inhibited-interaction' instead of blocking.  The signal is
+reported to the LLM as the tool result and the request continues.
+
+Set this to nil to let tools prompt as usual, at the risk of hanging
+Emacs when the tool is called from gptel's own process callbacks.
+
+Note that tool call confirmation (see `gptel-confirm-tool-calls')
+requires interaction.  When interaction is inhibited, a tool call
+that needs confirmation is not run: the error is returned as the tool
+result instead."
+  :group 'gptel
+  :type 'boolean)
+
 (defcustom gptel-tools nil
   "A list of tools to include with gptel requests.
 
@@ -1972,64 +1997,117 @@ injects the results into the prompt data and transitions the FSM."
     ;; All tools have run
     (when (<= (cl-decf remaining) 0) (gptel--fsm-transition fsm))))
 
+(defun gptel--tool-call-error-string (err)
+  "Return a tool result string describing the error ERR.
+
+Tool functions run inside gptel's process callbacks, so a signal from
+one of them cannot reach the user.  It is reported as the result of
+the tool call instead, which also lets the LLM react to it.
+
+Errors in the same format are used for synchronous tool errors in
+`gptel--handle-tool-use', so tool functions look the same to the LLM
+whether or not they complete synchronously."
+  (if (eq (car-safe err) 'inhibited-interaction)
+      (concat "Error: this tool tried to prompt the user.  Tool calls run "
+              "without user interaction, so no prompt can be answered.  Do "
+              "not ask the user for input; act on the information already "
+              "available.")
+    (mapconcat #'gptel--to-string err " ")))
+
+(defun gptel--invoke-tool (tool-spec arg-values deliver)
+  "Invoke TOOL-SPEC with ARG-VALUES, delivering the outcome to DELIVER.
+
+DELIVER is called with the result of the tool call.  If TOOL-SPEC is
+asynchronous, see `gptel-tool-async', it is also passed to the tool
+function as its first argument, and the tool calls it when it
+finishes.  Otherwise DELIVER is called with the return value here.
+
+A signal from the tool is passed to DELIVER as an error string instead
+of being allowed to propagate: tool functions are called from gptel's
+process filter, where a signal would abort the filter and leave the
+request waiting in the TOOL state forever.
+
+If `gptel-tool-call-inhibit-interaction' is non-nil, interaction and
+dialog boxes are disabled for the duration of the call, so that a tool
+cannot open a prompt that nothing can answer."
+  (let ((inhibit-interaction (or inhibit-interaction
+                                  gptel-tool-call-inhibit-interaction))
+        (use-dialog-box nil))
+    (condition-case err
+        (if (gptel-tool-async tool-spec)
+            (apply (gptel-tool-function tool-spec) deliver arg-values)
+          (funcall deliver (apply (gptel-tool-function tool-spec) arg-values)))
+      (error (funcall deliver (gptel--tool-call-error-string err))))))
+
 (defun gptel--handle-tool-use (fsm)
   "Run tool calls captured in FSM, and advance the state machine with the results."
-  (when-let* ((info (gptel-fsm-info fsm))
-              (backend (plist-get info :backend))
-              ;; This function might run many times, so only act on the remaining tool calls.
-              (tool-use (cl-remove-if (lambda (tc) (plist-get tc :result))
-                                      (plist-get info :tool-use))))
-    (with-current-buffer (plist-get info :buffer)
-      (let ((pending-calls))
-        (mapc                           ; Construct function calls
-         (lambda (tool-call)
-           (letrec ((args (plist-get tool-call :args))
-                    (name (plist-get tool-call :name))
-                    (tool-spec (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) name))
-                                           (plist-get info :tools)))
-                    (process-tool-result (apply-partially #'gptel--process-tool-call
-                                                          fsm tool-spec tool-call)))
-             (if (null tool-spec)
-                 (if (equal name gptel--ersatz-json-tool) ;Could be a JSON response
-                     (progn ;Handle structured JSON output supplied as tool call
-                       (funcall (plist-get info :callback)
-                                (gptel--json-encode (plist-get tool-call :args)) info)
-                       (plist-put info :tool-use ;Remove this tool call from the list
-                                  (cl-remove-if (lambda (tc) (equal (plist-get tc :name)
-                                                               gptel--ersatz-json-tool))
-                                                (plist-get info :tool-use)))
-                       (when (plist-get info :stream)
-                         (funcall (plist-get info :callback) t info)))
-		   (message "Unknown tool called by model: %s" name)
-                   (funcall process-tool-result
-                            (format "Error: Tool '%s' is not available. Available tools: %s"
-                                    name (mapconcat #'gptel-tool-name
-                                                    (plist-get info :tools) ", "))))
-               (let ((confirm))         ;Check if tool requires confirmation
-                 (cond      ;:confirm in tool-call (from hooks) takes precedence
-                  ((and-let* ((call-confirm (plist-member tool-call :confirm)))
-                     (prog1 t (setq confirm (cadr call-confirm)))))
-                  ((and gptel-confirm-tool-calls ;global and tool-specific setting
-                        (or (eq gptel-confirm-tool-calls t) ;always confirm, or
-                            (and-let* ((confirm (gptel-tool-confirm tool-spec)))
-                              (or (not (functionp confirm))
-                                  (apply confirm (gptel--map-tool-args tool-spec args))))))
-                   (setq confirm t)))
-                 (if confirm  ;To send to callback for confirmation
-                     (push (list tool-spec args process-tool-result) pending-calls)
-                   (let ((arg-values (gptel--map-tool-args tool-spec args)))
-                     (if (gptel-tool-async tool-spec) ;If not, run the tool
-                         (apply (gptel-tool-function tool-spec)
-                                process-tool-result arg-values)
-                       (let ((result (condition-case errdata
-                                         (apply (gptel-tool-function tool-spec) arg-values)
-                                       (error (mapconcat #'gptel--to-string errdata " ")))))
-                         (funcall process-tool-result result)))))))))
-         tool-use)
-        (when pending-calls
-          (plist-put info :tool-pending t)
-          (funcall (plist-get info :callback)
-                   (cons 'tool-call pending-calls) info))))))
+  (if-let* ((info (gptel-fsm-info fsm))
+            (backend (plist-get info :backend))
+            ;; This function might run many times, so only act on the remaining tool calls.
+            (tool-use (cl-remove-if (lambda (tc) (plist-get tc :result))
+                                    (plist-get info :tool-use))))
+      (with-current-buffer (plist-get info :buffer)
+        (let ((pending-calls))
+          (mapc                         ; Construct function calls
+           (lambda (tool-call)
+             (letrec ((args (plist-get tool-call :args))
+                      (name (plist-get tool-call :name))
+                      (tool-spec (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) name))
+                                             (plist-get info :tools)))
+                      (process-tool-result (apply-partially #'gptel--process-tool-call
+                                                            fsm tool-spec tool-call)))
+               (if (null tool-spec)
+                   (if (equal name gptel--ersatz-json-tool) ;Could be a JSON response
+                       (progn   ;Handle structured JSON output supplied as tool call
+                         (funcall (plist-get info :callback)
+                                  (gptel--json-encode (plist-get tool-call :args)) info)
+                         (plist-put info :tool-use ;Remove this tool call from the list
+                                    (cl-remove-if (lambda (tc) (equal (plist-get tc :name)
+                                                                 gptel--ersatz-json-tool))
+                                                  (plist-get info :tool-use)))
+                         (when (plist-get info :stream)
+                           (funcall (plist-get info :callback) t info)))
+		     (message "Unknown tool called by model: %s" name)
+                     (funcall process-tool-result
+                              (format "Error: Tool '%s' is not available. Available tools: %s"
+                                      name (mapconcat #'gptel-tool-name
+                                                      (plist-get info :tools) ", "))))
+                 (let ((confirm))       ;Check if tool requires confirmation
+                   (cond    ;:confirm in tool-call (from hooks) takes precedence
+                    ((and-let* ((call-confirm (plist-member tool-call :confirm)))
+                       (prog1 t (setq confirm (cadr call-confirm)))))
+                    ((and gptel-confirm-tool-calls ;global and tool-specific setting
+                          (or (eq gptel-confirm-tool-calls t) ;always confirm, or
+                              (and-let* ((confirm (gptel-tool-confirm tool-spec)))
+                                (or (not (functionp confirm))
+                                    (apply confirm (gptel--map-tool-args tool-spec args))))))
+                     (setq confirm t)))
+                   (cond
+                    ;; Confirmation needs the user, who cannot be reached from
+                    ;; here.  Report the reason to the LLM instead of blocking
+                    ;; on a prompt inside a process filter.
+                    ((and confirm inhibit-interaction)
+                     (funcall process-tool-result
+                              (concat "Error: Tool '" name "' requires confirmation "
+                                      "from the user, but interaction is inhibited "
+                                      "in this session.  Do not call tools that "
+                                      "need confirmation.")))
+                    ;; To send to callback for confirmation
+                    (confirm (push (list tool-spec args process-tool-result) pending-calls))
+                    ;; Run the tool
+                    (t (gptel--invoke-tool tool-spec (gptel--map-tool-args tool-spec args)
+                                           process-tool-result)))))))
+           tool-use)
+          (when pending-calls
+            (plist-put info :tool-pending t)
+            (funcall (plist-get info :callback)
+                     (cons 'tool-call pending-calls) info))))
+    ;; No tool calls left to run: either there are none, or they have all been
+    ;; run already (e.g. by a `gptel-pre-tool-call-functions' hook that supplied
+    ;; a :result).  `gptel--process-tool-call' transitions the FSM as each call
+    ;; finishes, so without a transition here the request would stall in the
+    ;; TOOL state forever.
+    (gptel--fsm-transition fsm)))
 
 (defun gptel--map-tool-args (tool-spec args)
   "Create a tool call argument list from TOOL-SPEC and ARGS.
