@@ -136,17 +136,26 @@ information if the stream contains it."
                               (usage (plist-get last-resp :usage)))
                     (gptel--openai-update-tokens usage info))
                   (when (plist-member info :reasoning-chunks) (plist-put info :reasoning-chunks nil)))
-              (when-let* ((response (gptel--json-read))
-                          (delta (map-nested-elt response '(:choices 0 :delta))))
+              (let ((response (gptel--json-read)))
+                ;; Some providers report failures in-band, inside a 200 stream
+                (when-let* ((error-data (gptel--in-band-error response)))
+                  (plist-put info :error error-data))
+                (when-let* ((delta (map-nested-elt response '(:choices 0 :delta))))
                 (if-let* ((content (plist-get delta :content))
                           ((not (or (eq content :null) (string-empty-p content)))))
                     (push content content-strs)
                   ;; No text content, so look for tool calls
                   (when-let* ((tool-call (map-nested-elt delta '(:tool_calls 0)))
                               (func (plist-get tool-call :function)))
-                    (if (and-let* ((func-name (plist-get func :name)) ((not (eq func-name :null))))
+                    (if (and-let* ((func-name (plist-get func :name))
+                                   ((not (eq func-name :null))))
                           ;; TEMP: This check is for litellm compatibility, should be removed
-                          (not (equal func-name "null"))) ; new tool block begins
+                          ;; Some providers repeat the function object with an empty
+                          ;; name in continuation chunks instead of omitting it, so
+                          ;; those are continuations of the last tool call too.
+                          (not (and (stringp func-name)
+                                    (or (equal func-name "null")
+                                        (string-empty-p func-name))))) ; new tool block begins
                         (progn
                           (when-let* ((partial (plist-get info :partial_json)))
                             (let* ((prev-tool-call (car (plist-get info :tool-use)))
@@ -176,7 +185,7 @@ information if the stream contains it."
                     (if-let* (((plist-member info :reasoning)) ;Is this a reasoning model?
                               (c (plist-get delta :content)) ;Started receiving text content?
                               ((not (or (eq c :null) (string-blank-p c)))))
-                        (plist-put info :reasoning-block t)))))))) ;Signal end of reasoning block
+                        (plist-put info :reasoning-block t))))))))) ;Signal end of reasoning block
       (error (goto-char (match-beginning 0))))
     (apply #'concat (nreverse content-strs))))
 
@@ -187,6 +196,9 @@ Mutate state INFO with response metadata."
   (let* ((choice0 (map-nested-elt response '(:choices 0)))
          (message (plist-get choice0 :message))
          (content (plist-get message :content)))
+    ;; Some providers report failures in-band, inside a 200 response
+    (when-let* ((error-data (gptel--in-band-error response)))
+      (plist-put info :error error-data))
     (plist-put info :stop-reason
                (plist-get choice0 :finish_reason))
     (gptel--openai-update-tokens (map-nested-elt response '(:usage)) info)

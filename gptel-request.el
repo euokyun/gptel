@@ -1314,6 +1314,24 @@ Return nil if no error occurred."
   (cond ((plistp response) (gptel--parse-response-plist-error response))
         ((arrayp response)
          (cl-some #'gptel--parse-response-plist-error response))))
+
+(defun gptel--in-band-error (response)
+  "Return the error object carried in-band by RESPONSE, if any.
+
+Some backends report a failure inside an HTTP 200 response: instead of
+a completion, the response contains an error object.  RESPONSE is the
+parsed JSON response (or stream chunk).  Return nil if it does not
+carry an error.
+
+Unlike `gptel--parse-response-error', only the `error' and `detail'
+keys are considered, because a top-level `message' key is part of some
+valid successful responses."
+  (when (plistp response)
+    (let ((error-data (or (plist-get response :error)
+                          (plist-get response :detail))))
+      (and error-data
+           (not (member error-data '(:null ""))) ;JSON null, or an empty string
+           error-data))))
 
 ;;; Logging
 
@@ -3126,8 +3144,22 @@ PROCESS and _STATUS are process parameters."
           (funcall (plist-get info :callback) nil info)))
        ;; Finish handling a successful streaming response
        ((member http-status '("200" "100"))
-        (with-demoted-errors "gptel callback error: %S"
-          (funcall (plist-get info :callback) t info)))
+        (cond
+         ;; An error object arrived in-band, inside the successfully-received
+         ;; stream.  `:error' is set by the stream parser of the backend.
+         ((plist-get info :error)
+          (with-demoted-errors "gptel callback error: %S"
+            (funcall (plist-get info :callback) nil info)))
+         ;; The stream carried no content at all: don't report success.
+         ((and (not (plist-get info :received-response))
+               (not (plist-get info :tool-use)))
+          (plist-put info :error "Empty response from the backend.")
+          (plist-put info :status "Empty response")
+          (with-demoted-errors "gptel callback error: %S"
+            (funcall (plist-get info :callback) nil info)))
+         (t
+          (with-demoted-errors "gptel callback error: %S"
+            (funcall (plist-get info :callback) t info)))))
        ;; Capture error message from HTTP error response
        (t
         (with-current-buffer proc-buf
@@ -3212,6 +3244,7 @@ Run the response callback with any completed chunks in OUTPUT."
                 (cond
                  ((stringp reasoning)
                   ;; Obtained from separate JSON field in response
+                  (plist-put proc-info :received-response t)
                   (funcall callback (cons 'reasoning reasoning) proc-info)
                   (unless reasoning-block ;Record that we're in a reasoning block (#709)
                     (plist-put proc-info :reasoning-block 'in))
@@ -3242,6 +3275,7 @@ Run the response callback with any completed chunks in OUTPUT."
                   (funcall callback '(reasoning . t) proc-info)
                   (plist-put proc-info :reasoning-block 'done))))
             (unless (equal response "") ;Response callback
+              (plist-put proc-info :received-response t)
               (funcall callback response proc-info))))))))
 
 (cl-defgeneric gptel-curl--parse-stream (backend proc-info)
@@ -3264,7 +3298,9 @@ PROCESS and _STATUS are process parameters."
     (when-let* (((eq (process-status process) 'exit))
                 (fsm (car (alist-get process gptel--request-alist)))
                 (proc-info (gptel-fsm-info fsm))
-                (proc-callback (plist-get proc-info :callback)))
+                ;; A request may have no callback; the response is then
+                ;; discarded, but the request still has to finish.
+                (proc-callback (or (plist-get proc-info :callback) #'ignore)))
       (when gptel-log-level (gptel-curl--log-response proc-buf proc-info)) ;logging
       (let ((exit-status (process-exit-status process)))
         (if (zerop exit-status)
@@ -3288,7 +3324,7 @@ PROCESS and _STATUS are process parameters."
                             ((stringp reasoning)))
                   (funcall proc-callback (cons 'reasoning reasoning) proc-info)))
               ;; Call callback with response text
-              (when (or response (not (member http-status '("200" "100"))))
+              (when (or response error (not (member http-status '("200" "100"))))
                 (with-demoted-errors "gptel callback error: %S"
                   (funcall proc-callback response proc-info))))
           ;; Curl exited with a non-zero status: connection-level failure
@@ -3300,8 +3336,11 @@ PROCESS and _STATUS are process parameters."
           (with-demoted-errors "gptel callback error: %S"
             (funcall proc-callback nil proc-info))))
       (gptel--fsm-transition fsm))      ;TYPE -> next
+    ;; Clean up even when the request could not be resumed: leaving the dead
+    ;; process in `gptel--request-alist' would leak it, and later requests for
+    ;; the same buffer would find it.
     (setf (alist-get process gptel--request-alist nil 'remove) nil)
-    (kill-buffer proc-buf)))
+    (when (buffer-live-p proc-buf) (kill-buffer proc-buf))))
 
 (defun gptel-curl--parse-response (proc-info)
   "Parse the buffer BUF with curl's response.
@@ -3328,11 +3367,23 @@ PROC-INFO is a plist with contextual information."
             (cond
              ;; FIXME Handle the case where HTTP 100 is followed by HTTP (not 200) BUG #194
              ((member http-status '("200" "100"))
-              (list (and-let* ((resp (gptel--parse-response
-                                      (plist-get proc-info :backend) response proc-info))
-                               ((not (string-blank-p resp))))
-                      (string-trim resp))
-                    http-status http-msg))
+              (let ((resp (and-let* ((resp (gptel--parse-response
+                                            (plist-get proc-info :backend)
+                                            response proc-info))
+                                     ((not (string-blank-p resp))))
+                            (string-trim resp))))
+                (cond
+                 ;; An error object in a 200 response
+                 ((and-let* ((error-data (gptel--in-band-error response)))
+                    (list nil http-status (concat "(" http-msg ") Error in response.")
+                          error-data)))
+                 ;; A tool call request has no response text
+                 ((or resp (plist-get proc-info :tool-use))
+                  (list resp http-status http-msg))
+                 ;; A 200 response with no content would otherwise end the
+                 ;; request silently, with no response and no error.
+                 (t (list nil http-status (concat "(" http-msg ") Empty response.")
+                          "Empty response from the backend.")))))
              ((and-let* ((error-data (gptel--parse-response-error response)))
                 (list nil http-status http-msg error-data)))
              ((eq response 'json-read-error)
