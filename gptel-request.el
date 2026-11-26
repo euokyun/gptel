@@ -109,6 +109,22 @@ Can be set to t, nil, or a string path to the curl executable."
           (const :tag "Use Curl" t)
           (string :tag "Specify path to the Curl executable")))
 
+(defcustom gptel-request-timeout nil
+  "Number of seconds to wait for a response before giving up.
+
+This is a limit on the entire request, including the time spent
+running tool calls and waiting for the user to confirm them, not just
+the time spent waiting for the network.
+
+If nil (the default), gptel waits indefinitely for a response.  Set
+this to a number to abort requests that no longer make progress: the
+request is aborted as with `gptel-abort', with an error explaining the
+timeout."
+  :group 'gptel
+  :type '(choice
+          (const :tag "Wait indefinitely" nil)
+          (integer :tag "Timeout in seconds")))
+
 (defcustom gptel-org-convert-response t
   "Whether gptel should convert Markdown responses to Org markup.
 
@@ -2517,8 +2533,45 @@ Initiate the request when done."
                    (gptel--request-data gptel-backend full-prompt)))
       (kill-buffer (current-buffer)))
     ;; INIT -> WAIT
-    (unless (plist-get info :dry-run) (gptel--fsm-transition fsm))
+    (unless (plist-get info :dry-run)
+      (gptel--fsm-transition fsm)
+      (when gptel-request-timeout (gptel--set-request-timeout fsm)))
     fsm))
+
+(defun gptel--set-request-timeout (fsm)
+  "Abort FSM's request if it is still running after `gptel-request-timeout'.
+
+The timer is one-shot: it fires once per request, and does nothing if
+the request has finished by then."
+  (run-at-time gptel-request-timeout nil #'gptel--timeout-request fsm))
+
+(defun gptel--timeout-request (fsm)
+  "Abort FSM's request, which has exceeded `gptel-request-timeout'.
+
+This is the same as aborting the request with `gptel-abort', except
+that the request is aborted even when it is not tracked in
+`gptel--request-alist' (for example while it is still being set up)."
+  (when (memq (gptel-fsm-state fsm) '(INIT WAIT TYPE TOOL TRET))
+    (let ((info (gptel-fsm-info fsm)))
+      (unless (plist-get info :error)
+        (plist-put info :error
+                   (format "Request timed out after %s seconds.  To change \
+the limit, see `gptel-request-timeout'." gptel-request-timeout)))
+      (plist-put info :status "Request timed out")
+      (with-demoted-errors "Callback error: %S"
+        (let ((callback (plist-get info :callback)))
+          (when (functionp callback) (funcall callback 'abort info))))
+      ;; Kill the process, if any, and stop tracking the request
+      (dolist (proc (cl-loop for entry in gptel--request-alist
+                             when (eq (cadr entry) fsm) collect (car entry)))
+        (ignore-errors (delete-process proc))
+        (setf (alist-get proc gptel--request-alist nil 'remove) nil))
+      (gptel--fsm-transition fsm 'ABRT)
+      (message "Aborted gptel request in buffer %s after %s seconds"
+               (if-let* ((buf (plist-get info :buffer)))
+                   (buffer-name buf)
+                 "unknown")
+               gptel-request-timeout))))
 
 (defun gptel-abort (buf)
   "Stop any active gptel process associated with buffer BUF.
