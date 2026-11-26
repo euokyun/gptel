@@ -44,6 +44,16 @@
 
 ** New features and UI changes
 
+- gptel can now save and restore additional per-conversation state in
+  Org buffers with the new abnormal hooks
+  ~gptel-org-save-state-functions~ and
+  ~gptel-org-restore-state-functions~.  Backends and packages can use
+  them to persist their own properties (such as a backend session ID)
+  in the same Org property drawer as the rest of gptel's state, instead
+  of advising internal functions.  Functions added to these hooks write
+  properties with ~org-entry-put~ and read them with ~org-entry-get~;
+  errors in them are demoted.
+
 - gptel now supports the "System One" API used by decision models such
   as Typesafe (Jev), Cloudflare (Clef) or Ollaya (various).  Decision
   models respond with probabilities or choices and produce no output

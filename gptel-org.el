@@ -214,6 +214,53 @@ restructure a gptel conversation saved in an Org buffer)."
   :type '(choice (const :tag "Org headlines" outline)
                  (const :tag "Inline (bold) text" inline)))
 
+(defcustom gptel-org-save-state-functions nil
+  "Abnormal hook to save additional gptel state in Org buffers.
+
+The functions in this hook are run at the end of
+`gptel-org--save-state', after gptel has written its own properties.
+They are called with no arguments, from the buffer being saved, with
+the buffer widened and point at the beginning of the buffer, where
+gptel's property drawer is available.  They are not run in Org
+buffers that have no gptel state.
+
+Use this to persist backend- or package-specific state (such as a
+backend session ID) along with the rest of a gptel conversation.
+Each function should write its own properties with `org-entry-put',
+and should not signal: errors in hook functions are demoted, so they
+cannot prevent the buffer from being saved.
+
+For example:
+
+  (defun my-backend-save-session-id ()
+    \"Store the backend session ID in the gptel property drawer.\"
+    (org-entry-put (point-min) \"GPTEL_MY_BACKEND_SESSION\"
+                   my-backend-session-id))
+
+  (add-hook \\='gptel-org-save-state-functions
+            #\\='my-backend-save-session-id)
+
+See `gptel-org-restore-state-functions' for the reverse."
+  :group 'gptel
+  :type 'hook)
+
+(defcustom gptel-org-restore-state-functions nil
+  "Abnormal hook to restore additional gptel state in Org buffers.
+
+The functions in this hook are run at the end of
+`gptel-org--restore-state', i.e. after gptel has restored its own
+properties when `gptel-mode' is turned on.  They are called with no
+arguments, from the buffer being restored, with the buffer widened and
+point at the beginning of the buffer.  They are not run in Org buffers
+that have no gptel state.
+
+Use this to restore state saved by `gptel-org-save-state-functions',
+typically by reading a property with `org-entry-get'.  Errors in hook
+functions are demoted, so they cannot break the restoration of gptel's
+own state."
+  :group 'gptel
+  :type 'hook)
+
 (defconst gptel-org--link-regex
   (concat "\\(?:" org-link-bracket-re "\\|" org-link-angle-re "\\)")
   "Link regex for `gptel-mode' in Org mode.")
@@ -569,6 +616,19 @@ ARGS are the original function call arguments."
 
 
 ;;; Saving and restoring state
+(defun gptel-org--properties-p (&optional pt)
+  "Return non-nil if gptel state is stored as properties under PT.
+
+PT defaults to the current position.  The properties checked are the
+ones written by `gptel-org-set-properties' and
+`gptel-org--save-state'."
+  (let ((pt (or pt (point))))
+    (or (org-entry-get pt "GPTEL_BOUNDS" 'selective)
+        (cl-some (lambda (prop) (org-entry-get pt prop 'selective))
+                 '("GPTEL_PRESET" "GPTEL_SYSTEM" "GPTEL_BACKEND" "GPTEL_MODEL"
+                   "GPTEL_TEMPERATURE" "GPTEL_MAX_TOKENS"
+                   "GPTEL_NUM_MESSAGES_TO_SEND" "GPTEL_TOOLS")))))
+
 (defun gptel-org--entry-properties (&optional pt)
   "Find gptel configuration properties stored at PT."
   (pcase-let
@@ -635,7 +695,16 @@ ARGS are the original function call arguments."
             (when num (setq-local gptel--num-messages-to-send num))
             (when tools (setq-local gptel-tools tools))))
       (:success (message "gptel chat restored."))
-      (error (message "Could not restore gptel state, sorry! Error: %s" status)))))
+      (error (message "Could not restore gptel state, sorry! Error: %s" status)))
+    ;; Restore additional state written by extensions, see
+    ;; `gptel-org-restore-state-functions'.
+    (when (gptel-org--properties-p (point-min))
+      (run-hook-wrapped
+       'gptel-org-restore-state-functions
+       (lambda (func)
+         (with-demoted-errors "gptel-org-restore-state-functions: %S"
+           (funcall func))
+         nil)))))                       ;always return nil so the rest run
 
 (defun gptel-org-set-properties (pt &optional msg)
   "Store the active gptel configuration under the current heading.
@@ -650,7 +719,11 @@ Additional metadata is stored only if no preset was applied or if it
 differs from the preset specification.  This is limited to the active
 gptel model and backend names, the system message, active tools, the
 response temperature, max tokens and number of conversation turns to
-send in queries.  (See `gptel--num-messages-to-send' for the last one.)"
+send in queries.  (See `gptel--num-messages-to-send' for the last one.)
+
+Additional properties can be stored by extensions, see
+`gptel-org-save-state-functions' and
+`gptel-org-restore-state-functions'."
   (interactive (list (point) t))
   (require 'gptel)
   (let ((preset-spec (and gptel--preset (gptel-get-preset gptel--preset))))
@@ -718,7 +791,16 @@ send in queries.  (See `gptel--num-messages-to-send' for the last one.)"
                  (when (and (not (= (marker-position offset-marker) offset))
                             (> attempts 0))
                    (funcall write-bounds (1- attempts)))))))
-     (funcall write-bounds 6))))
+     (funcall write-bounds 6))
+   ;; Save additional state written by extensions, see
+   ;; `gptel-org-save-state-functions'.
+   (when (gptel-org--properties-p (point-min))
+     (run-hook-wrapped
+      'gptel-org-save-state-functions
+      (lambda (func)
+        (with-demoted-errors "gptel-org-save-state-functions: %S"
+          (funcall func))
+        nil)))))                        ;always return nil so the rest run
 
 
 ;;; Transforming responses
