@@ -26,6 +26,7 @@
 (require 'cl-lib)
 (require 'org-element)
 (require 'outline)
+(require 'subr-x)
 (require 'mailcap)                    ;FIXME Avoid this somehow
 (eval-when-compile (require 'gptel-request))
 
@@ -201,6 +202,17 @@ missing their outer pipes get them, so that the table is valid Org
 table syntax.  The columns are not aligned, see `org-table-align'."
   :group 'gptel
   :type 'boolean)
+
+(defcustom gptel-org-response-headings 'outline
+  "How to convert Markdown headings in LLM responses to Org.
+`outline' (the default) converts them to Org headlines at the same
+level, so the response becomes part of the buffer's outline.
+`inline' converts them to inline bold text instead, so the model's
+headings do not become outline structure (which would, for example,
+restructure a gptel conversation saved in an Org buffer)."
+  :group 'gptel
+  :type '(choice (const :tag "Org headlines" outline)
+                 (const :tag "Inline (bold) text" inline)))
 
 (defconst gptel-org--link-regex
   (concat "\\(?:" org-link-bracket-re "\\|" org-link-angle-re "\\)")
@@ -868,6 +880,18 @@ region twice is harmless."
                                    (line-beginning-position)))))
     hold))
 
+(defun gptel-org--inline-heading (heading)
+  "Replace the Markdown heading at point with Org bold text.
+
+HEADING is the string of hashes before point.  The text of the
+heading is taken from the rest of the line, and an empty heading is
+removed entirely."
+  (let* ((beg (line-beginning-position))
+         (text (string-trim (buffer-substring-no-properties
+                             (+ beg (length heading)) (line-end-position)))))
+    (delete-region beg (line-end-position))
+    (insert (if (string-empty-p text) "" (concat "*" text "*")))))
+
 ;;;###autoload
 (defun gptel--convert-markdown->org (str)
   "Convert string STR from markdown to org markup.
@@ -893,8 +917,10 @@ elements."
         ((and (guard (eq (char-before) ?#)) heading)
          (cond
           ((looking-at "[[:space:]]")   ;Handle headings
-           (delete-region (line-beginning-position) (point))
-           (insert (make-string (length heading) ?*)))
+           (if (eq gptel-org-response-headings 'inline)
+               (gptel-org--inline-heading heading)
+             (delete-region (line-beginning-position) (point))
+             (insert (make-string (length heading) ?*))))
           ((looking-at "\\+begin_src") ;Overeager LLM switched to using Org src blocks
            (save-match-data (re-search-forward "^#\\+end_src" nil t)))))
         ;; Handle emphasis
@@ -1026,8 +1052,18 @@ cleaning up after."
                     ((eobp)       ; Not enough information about the heading yet
                      (setq noop-p t) (set-marker start-pt (match-beginning 0)))
                     ((looking-at "[[:space:]]") ; Convert markdown heading to Org heading
-                     (delete-region (line-beginning-position) (point))
-                     (insert (make-string (length heading) ?*)))
+                     (if (not (eq gptel-org-response-headings 'inline))
+                         (progn (delete-region (line-beginning-position) (point))
+                                (insert (make-string (length heading) ?*)))
+                       ;; An inline heading is wrapped in bold text, which needs
+                       ;; the whole line: wait for the rest of it.
+                       (if (= (line-end-position) (point-max))
+                           ;; NOTE: `match-beginning' is out of date here, see
+                           ;; the `looking-at' above.
+                           (progn (setq noop-p t)
+                                  (set-marker start-pt (- (point) (length heading)))
+                                  (goto-char (line-end-position)))
+                         (gptel-org--inline-heading heading))))
                     ((< (- (point-max) (point)) 11) ;Not enough information to check if Org src block
                      (setq noop-p t) (set-marker start-pt (match-beginning 0)))
                     ((looking-at "\\+begin_src ") ;Overeager LLM switched to using Org src blocks
