@@ -90,6 +90,14 @@
 
 ** Notable bug fixes
 
+- Session state is now written at the very end of saving, after every
+  member of ~before-save-hook~.  The state that gptel saves includes
+  buffer positions, so anything that edits the buffer during saving --
+  trimming trailing whitespace, inserting a table of contents -- used to
+  leave ~GPTEL_BOUNDS~ pointing at the wrong text and corrupted the
+  session the next time it was opened.  Positions that do not fit the
+  buffer are now dropped with a warning instead of being written.
+
 - Non UTF-8 characters or raw bytes in tool call results are replaced
   with a readable placeholder, ensuring that the tool call loop can
   continue uninterrupted.

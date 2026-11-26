@@ -687,6 +687,74 @@ Link failed to validate, see `gptel-markdown-validate-link' or `gptel-org-valida
           (setq prev-pt (point)))
         bounds))))
 
+(defun gptel--bound-usable-p (beg end)
+  "Return non-nil if the region from BEG to END is usable in this buffer.
+
+BEG and END must be integers within the accessible buffer positions,
+with BEG not after END."
+  (and (integerp beg) (integerp end)
+       (<= (point-min) beg) (<= beg end) (<= end (point-max))))
+
+(defun gptel--tool-call-bound-p (beg)
+  "Return non-nil if BEG looks like the start of a stored tool call.
+
+Tool calls live in `#+begin_tool' blocks in Org and in fenced blocks
+elsewhere, so BEG must be at a block boundary: the end of a header
+line, the start of one, or the start of the line after one.  Text that
+carries a tool call property but does not start at a block boundary has
+been shifted by an edit, and restoring the property there would corrupt
+the session."
+  (let ((header "[ \t]*\\(?:#\\+begin_tool\\|```\\)"))
+    (save-excursion
+      (goto-char beg)
+      (or (looking-at-p header)                  ;start of a header line
+          (and (eq (char-after) ?\n)             ;end of a header line
+               (progn (forward-line 0) (looking-at-p header)))
+          (and (bolp)                            ;start of the body line
+               (progn (forward-line -1) (looking-at-p header)))))))
+
+(defun gptel--valid-bounds (bounds-alist)
+  "Return BOUNDS-ALIST with unusable response boundaries removed.
+
+BOUNDS-ALIST is of the form (PROP . ((BEG END [VAL]) ...)), as
+returned by `gptel--get-buffer-bounds' and accepted by
+`gptel--restore-props'.  The legacy (BEG . END) structure is also
+accepted.
+
+A boundary is dropped if it does not describe a usable region (see
+`gptel--bound-usable-p'), or if it claims to start a tool call that
+does not start there.  The boundaries are buffer positions, which other
+members of `before-save-hook' may invalidate by editing the buffer:
+restoring such a boundary puts gptel text properties in the wrong
+place, which corrupts the session when the file is next visited.  A
+dropped tool boundary costs less than a misplaced one -- the block is
+then read back as user text instead of as a tool result -- and the
+warning names it, so the trade is deliberate.  The shape of
+BOUNDS-ALIST is unchanged when all of it is valid."
+  (let ((bad nil) (kept nil) (legacy (not (symbolp (caar bounds-alist)))))
+    (save-restriction
+      (widen)
+      (dolist (entry bounds-alist)
+        (if legacy
+            (if (gptel--bound-usable-p (car entry) (cdr entry))
+                (push entry kept)
+              (push (cons 'response entry) bad))
+          (let ((bounds (cdr entry)) (ok nil))
+            (dolist (bound bounds)
+              (if (and (gptel--bound-usable-p (car bound) (cadr bound))
+                       (or (not (eq (car entry) 'tool))
+                           (not (> (length bound) 2))
+                           (gptel--tool-call-bound-p (car bound))))
+                  (push bound ok)
+                (push (cons (car entry) bound) bad)))
+            (when ok (push (cons (car entry) (nreverse ok)) kept))))))
+    (when bad
+      (display-warning
+       '(gptel save-state)
+       (format "Ignoring invalid gptel response bounds (property . bounds): %S"
+               (nreverse bad))))
+    (nreverse kept)))
+
 (define-obsolete-function-alias
   'gptel--get-bounds 'gptel--get-response-bounds "0.9.8")
 
@@ -722,7 +790,14 @@ set to (PROP . VAL).  For (BEG END) forms, except when PROP is response,
 the gptel property is set to just PROP.
 
 The legacy structure, a list of (BEG . END) is also supported and will be
-applied before being re-persisted in the new structure."
+applied before being re-persisted in the new structure.
+
+Boundaries that do not describe a usable region are dropped with a
+warning, see `gptel--valid-bounds'."
+  ;; Drop boundaries that cannot be restored at the right place: they were
+  ;; computed before an edit to the text around them, and applying them
+  ;; blindly would corrupt the session.
+  (setq bounds-alist (gptel--valid-bounds bounds-alist))
   ;; Run silently to avoid `gptel--inherit-stickiness' and other hooks that
   ;; might modify the gptel text property.
   (with-silent-modifications
@@ -803,7 +878,33 @@ Additional metadata is stored only if no preset was applied or if it
 differs from the preset specification.  This is limited to the active
 gptel model and backend names, the system message, active tools, the
 response temperature, max tokens and number of conversation turns to
-send in queries.  (See `gptel--num-messages-to-send' for the last one.)"
+send in queries.  (See `gptel--num-messages-to-send' for the last one.)
+
+This function is added to `write-contents-functions' so that it runs
+after every member of `before-save-hook': those may edit the buffer
+(trim whitespace, insert a table of contents), which would invalidate
+the response boundaries saved here.  It always returns nil, which is
+load-bearing: a non-nil return value would tell `basic-save-buffer'
+that the buffer has been written, and the actual write would be
+skipped.  Errors while saving are demoted to warnings: a failure to
+save the state must never prevent the buffer from being saved."
+  ;; Errors are caught here rather than with `with-demoted-errors', which
+  ;; lets them through when `debug-on-error' is non-nil.
+  (condition-case err
+      (progn (gptel--save-state-1) nil) ;must stay nil, see docstring
+    (error
+     (display-warning
+      '(gptel save-state)
+      (format "Could not save gptel state in buffer \"%s\": %s"
+              (buffer-name) (error-message-string err)))
+     nil)))                         ;`display-warning' returns non-nil
+
+(defun gptel--save-state-1 ()
+  "Save the gptel state in the current buffer.
+
+See `gptel--save-state' for the state that is stored.  Unlike
+`gptel--save-state', this may signal an error, and its return value is
+not meaningful."
   (run-hooks 'gptel-save-state-hook)
   (if (derived-mode-p 'org-mode)
       (progn
@@ -853,7 +954,8 @@ send in queries.  (See `gptel--num-messages-to-send' for the last one.)"
               (add-file-local-variable 'gptel--num-messages-to-send
                                        gptel--num-messages-to-send)
             (delete-file-local-variable 'gptel--num-messages-to-send))
-          (add-file-local-variable 'gptel--bounds (gptel--get-buffer-bounds)))))))
+          (add-file-local-variable
+           'gptel--bounds (gptel--valid-bounds (gptel--get-buffer-bounds))))))))
 
 
 ;;; Minor modes and UI
@@ -1076,7 +1178,11 @@ TOKENS-FULL is the cumulative token usage for the request (so far)."
         (unless (derived-mode-p 'org-mode 'markdown-mode 'text-mode)
           (gptel-mode -1)
           (user-error (format "`gptel-mode' is not supported in `%s'." major-mode)))
-        (add-hook 'before-save-hook #'gptel--save-state nil t)
+        ;; Save the session state as late as possible.  This runs after
+        ;; every `before-save-hook' member -- including ones added later,
+        ;; which may edit the buffer -- because `basic-save-buffer' runs
+        ;; `write-contents-functions' only after that hook is done.
+        (add-hook 'write-contents-functions #'gptel--save-state t t)
         (add-hook 'after-change-functions 'gptel--inherit-stickiness nil t)
         (gptel--prettify-preset)
         (cond
@@ -1095,7 +1201,7 @@ TOKENS-FULL is the cumulative token usage for the request (so far)."
             (progn (setq gptel--old-header-line header-line-format)
                    (gptel-use-header-line))
           (gptel--update-status " Ready" 'success)))
-    (remove-hook 'before-save-hook #'gptel--save-state t)
+    (remove-hook 'write-contents-functions #'gptel--save-state t)
     (remove-hook 'after-change-functions 'gptel--inherit-stickiness t)
     (cond
      ((derived-mode-p 'org-mode)

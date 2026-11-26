@@ -57,6 +57,7 @@
 (declare-function gptel--with-buffer-copy "gptel-request" nil t)
 (declare-function gptel--file-binary-p "gptel-request")
 (declare-function gptel--get-buffer-bounds "gptel")
+(declare-function gptel--valid-bounds "gptel")
 (declare-function gptel--restore-props "gptel")
 (declare-function org-entry-get "org")
 (declare-function org-entry-put "org")
@@ -772,26 +773,41 @@ Additional properties can be stored by extensions, see
     (message "Added gptel configuration to current headline.")))
 
 (defun gptel-org--save-state ()
-  "Write the gptel state to the Org buffer as Org properties."
+  "Write the gptel state to the Org buffer as Org properties.
+
+The response boundaries are buffer positions, so they are affected by
+the length of the drawer they are stored in: writing the drawer moves
+the text it points at.  They are therefore recomputed and rewritten
+until the stored value is unchanged by its own write, which normally
+takes two passes.  Saving an unmodified buffer again changes nothing,
+so saving is idempotent."
   (org-with-wide-buffer
    (goto-char (point-min))
    (when (org-at-heading-p)
      (org-open-line 1))
    (gptel-org-set-properties (point-min))
    ;; Save response boundaries
-   (letrec ((write-bounds
-             (lambda (attempts)
-               (when-let* ((bounds (gptel--get-buffer-bounds))
-                           ;; first value of ((prop . ((beg end val)...))...)
-                           (offset (caadar bounds))
-                           (offset-marker (set-marker (make-marker) offset)))
-                 (let ((print-length))
-                   (org-entry-put (point-min) "GPTEL_BOUNDS"
-                                  (prin1-to-string (gptel--get-buffer-bounds))))
-                 (when (and (not (= (marker-position offset-marker) offset))
-                            (> attempts 0))
-                   (funcall write-bounds (1- attempts)))))))
-     (funcall write-bounds 6))
+   (let ((print-length))
+     (cl-labels ((serialize ()
+                   (prin1-to-string
+                    (gptel--valid-bounds (gptel--get-buffer-bounds)))))
+       (let ((serialized (serialize)))
+         ;; With no responses to record, leave any existing drawer alone.
+         (unless (equal serialized "nil")
+           (let ((stored (org-entry-get (point-min) "GPTEL_BOUNDS" 'selective))
+                 (passes 0))
+             (while (and (< passes 4) (not (equal stored serialized)))
+               (org-entry-put (point-min) "GPTEL_BOUNDS" serialized)
+               (setq stored serialized
+                     passes (1+ passes)
+                     serialized (serialize)))
+             ;; Give up instead of writing bounds that cannot be trusted.
+             (unless (equal stored serialized)
+               (display-warning
+                '(gptel save-state)
+                (format "gptel response bounds in buffer \"%s\" did not \
+settle after %d passes, they may be off"
+                        (buffer-name) passes))))))))
    ;; Save additional state written by extensions, see
    ;; `gptel-org-save-state-functions'.
    (when (gptel-org--properties-p (point-min))
