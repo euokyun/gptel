@@ -29,6 +29,7 @@
 (require 'subr-x)
 (require 'mailcap)                    ;FIXME Avoid this somehow
 (eval-when-compile (require 'gptel-request))
+(declare-function gptel--session-file-p "gptel")
 
 ;; Functions used for saving/restoring gptel state in Org buffers
 (defvar gptel--num-messages-to-send)
@@ -714,31 +715,18 @@ ARGS are the original function call arguments."
 
 
 ;;; Saving and restoring state
-(defconst gptel-org--state-properties
-  '("GPTEL_BOUNDS" "GPTEL_PRESET" "GPTEL_SYSTEM" "GPTEL_BACKEND" "GPTEL_MODEL"
-    "GPTEL_TEMPERATURE" "GPTEL_MAX_TOKENS" "GPTEL_NUM_MESSAGES_TO_SEND"
-    "GPTEL_TOOLS")
-  "Org properties that mark a buffer as holding gptel state.
-
-These are the properties written by `gptel-org-set-properties' and
-`gptel-org--save-state'.  The list is used both for looking properties
-up with `org-entry-get' (see `gptel-org--properties-p') and for
-searching the text of the buffer (see `gptel-org-session-p' and
-`gptel-org--state-property-regexp'), so the two ways of asking whether
-a buffer holds gptel state always agree.")
-
-(defconst gptel-org--state-property-regexp
-  (concat "^[ \t]*:" (regexp-opt gptel-org--state-properties) ":")
-  "Regexp matching an Org property line that names gptel state.
-
-See `gptel-org--state-properties' and `gptel-org-session-p'.")
+;; The list of state properties and the regexp that matches them live in
+;; gptel.el, see `gptel--session-state-properties': gptel has to be able to
+;; recognize a session file before gptel-org is loaded.
+(defvar gptel--session-state-properties)
+(defvar gptel--session-state-property-regexp)
 
 (defun gptel-org-session-p (&optional buffer)
   "Return non-nil if BUFFER (default: current buffer) holds gptel session state.
 
 A buffer holds gptel session state if it visits a file, and that file
 contains the Org properties written by `gptel-org--save-state' (see
-`gptel-org--state-properties'), which include the response bounds in
+`gptel--session-state-properties'), which include the response bounds in
 `GPTEL_BOUNDS'.
 
 Unlike `gptel-org--properties-p', which asks Org for an entry property
@@ -747,35 +735,24 @@ looks at the text of the buffer, so it works in any major mode.  That
 is the point of it: it is called from `find-file-hook', where the major
 mode may already have been replaced by something else -- typically
 `so-long-mode', which `global-so-long-mode' can install before
-`find-file-hook' runs at all.
-
-It does not move point, does not depend on the major mode, and only
-searches the first few kilobytes of the buffer, where the property
-drawer is written."
+`find-file-hook' runs at all.  The check itself is
+`gptel--session-file-p', in gptel.el, so that gptel can make it before
+gptel-org is loaded."
   (with-current-buffer (or buffer (current-buffer))
-    (and buffer-file-name
-         (save-restriction
-           (widen)
-           (save-excursion
-             (save-match-data
-               (goto-char (point-min))
-               ;; 4kB is plenty: gptel writes the drawer at `point-min'.
-               (re-search-forward gptel-org--state-property-regexp
-                                  (min (point-max) (+ (point-min) 4096))
-                                  t)))))))
+    (gptel--session-file-p)))
 
 (defun gptel-org--properties-p (&optional pt)
   "Return non-nil if gptel state is stored as properties under PT.
 
 PT defaults to the current position.  The properties checked are the
 ones written by `gptel-org-set-properties' and
-`gptel-org--save-state', see `gptel-org--state-properties'.
+`gptel-org--save-state', see `gptel--session-state-properties'.
 
 This needs `org-mode'; see `gptel-org-session-p' for a check that does
 not."
   (let ((pt (or pt (point))))
     (cl-some (lambda (prop) (org-entry-get pt prop 'selective))
-             gptel-org--state-properties)))
+             gptel--session-state-properties)))
 
 (defun gptel-org--entry-properties (&optional pt)
   "Find gptel configuration properties stored at PT."
@@ -1057,13 +1034,11 @@ it does three things, in this order:
 Errors are demoted: a broken session file must not make visiting files
 fail.
 
-This function is added to `find-file-hook' when gptel-org is loaded, so
-it applies from that point on.  gptel loads gptel-org lazily -- from
-`gptel-mode' and `gptel--restore-state' -- so a session file visited
-before gptel-org was first loaded is not set up; loading gptel-org
-eagerly instead is not worth slowing startup down for.  Enable this
-feature before visiting sessions by loading `gptel' and `gptel-org' at
-startup."
+This is called by `gptel--session-find-file-setup', which gptel.el adds
+to `find-file-hook', so it applies from startup on: gptel loads
+gptel-org lazily, and the point of the gptel.el wrapper is that a
+session file is set up when it is first visited, whichever of the two
+libraries happen to be loaded by then."
   (unless gptel-org--in-find-file-setup
     (let ((gptel-org--in-find-file-setup t))
       (with-demoted-errors "gptel-org: Session setup failed: %S"
@@ -1075,8 +1050,6 @@ startup."
                      (derived-mode-p 'org-mode))
             (require 'gptel)
             (gptel-mode 1)))))))
-
-(add-hook 'find-file-hook #'gptel-org--find-file-setup)
 
 
 ;;; Transforming responses

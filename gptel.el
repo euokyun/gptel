@@ -206,6 +206,7 @@
 (declare-function gptel-org--save-state "gptel-org")
 (declare-function gptel-org--restore-state "gptel-org")
 (declare-function gptel-org--annotate-links "gptel-org")
+(declare-function gptel-org--find-file-setup "gptel-org")
 (define-obsolete-function-alias
   'gptel-set-topic 'gptel-org-set-topic "0.7.5")
 
@@ -779,6 +780,56 @@ BOUNDS-ALIST is unchanged when all of it is valid."
 
 
 ;;; Saving and restoring state
+;; The properties that gptel state is stored under in an Org file are listed
+;; here, in gptel.el, and not with the rest of the Org support in gptel-org.el,
+;; because they are needed to recognize a session file before gptel-org is
+;; loaded.  See `gptel--session-find-file-setup'.
+(defconst gptel--session-state-properties
+  '("GPTEL_BOUNDS" "GPTEL_PRESET" "GPTEL_SYSTEM" "GPTEL_BACKEND" "GPTEL_MODEL"
+    "GPTEL_TEMPERATURE" "GPTEL_MAX_TOKENS" "GPTEL_NUM_MESSAGES_TO_SEND"
+    "GPTEL_TOOLS")
+  "Org properties that mark a buffer as holding gptel state.
+
+These are the properties written by `gptel-org-set-properties' and
+`gptel-org--save-state'.  The list is used both for looking properties
+up with `org-entry-get' (see `gptel-org--properties-p') and for
+searching the text of the buffer (see `gptel-org-session-p'),
+`gptel--session-file-p' and `gptel--session-state-property-regexp'), so
+the two ways of asking whether a buffer holds gptel state always
+agree.")
+
+(defconst gptel--session-state-property-regexp
+  (concat "^[ \t]*:" (regexp-opt gptel--session-state-properties) ":")
+  "Regexp matching an Org property line that names gptel state.
+
+See `gptel--session-state-properties' and `gptel--session-file-p'.")
+
+(defun gptel--session-file-p ()
+  "Return non-nil if the current buffer holds gptel session state.
+
+A buffer holds gptel session state if it visits a file, and that file
+contains the Org properties written by `gptel-org--save-state' (see
+`gptel--session-state-properties'), which include the response bounds
+in `GPTEL_BOUNDS'.
+
+The file is only read as text, so this needs neither `org-mode' nor
+gptel-org: it is what `gptel--session-find-file-setup' runs in
+`find-file-hook' to decide whether gptel-org is worth loading.  It does
+not move point, does not depend on the major mode -- which may already
+have been replaced by `so-long-mode' -- and only searches the first few
+kilobytes of the buffer, where the property drawer is written.
+
+See `gptel-org-session-p' for the public entry point."
+  (and buffer-file-name
+       (save-restriction
+         (widen)
+         (save-excursion
+           (save-match-data
+             (goto-char (point-min))
+             ;; 4kB is plenty: gptel writes the drawer at `point-min'.
+             (re-search-forward gptel--session-state-property-regexp
+                                (min (point-max) (+ (point-min) 4096))
+                                t))))))
 
 (defun gptel--restore-props (bounds-alist)
   "Restore text properties from BOUNDS-ALIST.
@@ -956,6 +1007,38 @@ not meaningful."
             (delete-file-local-variable 'gptel--num-messages-to-send))
           (add-file-local-variable
            'gptel--bounds (gptel--valid-bounds (gptel--get-buffer-bounds))))))))
+
+(defun gptel--session-find-file-setup ()
+  "Prepare a visited file for holding a gptel session.
+
+Runs from `find-file-hook', which gptel registers itself, so that it
+applies as soon as gptel is loaded.  The work is done by
+`gptel-org--find-file-setup', which lives in gptel-org: it re-reads the
+file with the right coding system, keeps `so-long' from replacing the
+major mode, and turns on `gptel-mode' to restore the session, in that
+order.
+
+The registration has to be here rather than in gptel-org.el because
+gptel loads gptel-org lazily -- from `gptel-mode' and
+`gptel--restore-state' -- so a hook registered there does not exist yet
+when a session file is first visited, and by the time `gptel-mode'
+loads gptel-org it is too late: restoring a session with the coding
+system Emacs guessed for a file with a NUL byte in it, or after
+`so-long' replaced the major mode, restores the response bounds at the
+wrong positions, which is exactly the corruption
+`gptel-org--find-file-setup' is meant to prevent.
+
+To keep ordinary file visits free, gptel-org is loaded and called only
+if the buffer passes the textual check in `gptel--session-file-p' --
+two regexp searches in the first 4kB, no `org-mode', no gptel-org.
+Errors are demoted: a broken session file must not make visiting files
+fail."
+  (with-demoted-errors "gptel: Session setup failed: %S"
+    (when (gptel--session-file-p)
+      (require 'gptel-org)
+      (gptel-org--find-file-setup))))
+
+(add-hook 'find-file-hook #'gptel--session-find-file-setup)
 
 
 ;;; Minor modes and UI
