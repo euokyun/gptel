@@ -295,6 +295,36 @@ received it current."
      ;; saving the user's file.
      (message "gptel-autosave: saving to a temporary file is not implemented yet"))))
 
+(defcustom gptel-close-unterminated-blocks t
+  "Whether to close Org blocks that the response left open.
+
+gptel inserts the closing `#+end_...' line of a block only when it
+knows that the block has ended: when the backend signals the end of a
+reasoning block, when a tool call result is complete, or, for
+converted code fences, when the stream ends.  A response that is
+aborted, that fails or that is cut off by the token limit therefore
+leaves `#+begin_reasoning', `#+begin_tool' or `#+begin_src' open, and
+Org -- including gptel's own parsing of the buffer for the next
+request -- reads the rest of the buffer as part of that block.
+
+The value can be
+
+  t        Close unfinished blocks at the end of every response.  No
+           text is inserted when the blocks are balanced, so this only
+           affects responses that were cut off.
+
+  aborted  Close them only for a response that did not complete, i.e.
+           one that was aborted, timed out or failed.
+
+  nil      Never touch the response text.
+
+This applies to Org buffers only; markdown fences are left alone."
+  :type '(choice
+          (const :tag "Always" t)
+          (const :tag "Only for aborted or failed responses" aborted)
+          (const :tag "Never" nil))
+  :group 'gptel)
+
 (defcustom gptel-post-stream-hook nil
   "Hook run after each insertion of the LLM's streaming response.
 
@@ -1593,6 +1623,57 @@ buffer."
          (slot . 10)
          (body-function . select-window))))))
 
+(defun gptel--close-unterminated-blocks (info &optional completed)
+  "Close Org blocks left open in INFO's response region.
+
+gptel inserts a block's closing `#+end_...' line only when the backend
+reports the end of the block (`#+end_reasoning', `#+end_tool') or the
+end of the stream.  A response that is aborted, that times out, or
+whose stream dies therefore leaves `#+begin_reasoning',
+`#+begin_tool' or a converted code fence (`#+begin_src') without its
+closing line.  Org then reads the rest of the buffer -- and so does
+`gptel-org' when it builds the next request -- as block contents.
+
+Append the missing closing lines, innermost block first.  Nothing is
+inserted when the region is balanced, so running this for every
+response is harmless.
+
+COMPLETED is non-nil for a response that finished normally, in which
+case only `gptel-close-unterminated-blocks' set to t applies.  See
+that variable."
+  (when (if completed
+            (eq gptel-close-unterminated-blocks t)
+          gptel-close-unterminated-blocks)
+    (when-let* ((start-marker (plist-get info :position))
+                (buffer (marker-buffer start-marker))
+                ((buffer-live-p buffer)))
+      (with-current-buffer buffer
+        (when (and (derived-mode-p 'org-mode)
+                   (not (plist-get info :in-place))
+                   (not buffer-read-only))
+          (let ((end (marker-position (or (plist-get info :tracking-marker)
+                                          start-marker)))
+                (open nil))
+            (save-excursion
+              (goto-char (marker-position start-marker))
+              (while (re-search-forward
+                      "^[ \t]*#\\+\\(begin\\|end\\)_\\([^ \t\n]+\\)" end t)
+                (let ((name (downcase (match-string 2))))
+                  (if (equal (match-string 1) "begin")
+                      (push name open)
+                    (when (equal (car open) name) (pop open))))))
+            (when open
+              (save-excursion
+                (when-let* ((tm (plist-get info :tracking-marker)))
+                  (set-marker-insertion-type tm t))
+                (goto-char end)
+                (unless (bolp) (insert "\n"))
+                (insert (mapconcat (lambda (name) (concat "#+end_" name))
+                                   open "\n")
+                        "\n")
+                (when-let* ((tm (plist-get info :tracking-marker)))
+                  (set-marker-insertion-type tm nil))))))))))
+
 ;;;; State machine handlers
 ;; The next few functions are default state handlers for gptel-send, see
 ;; `gptel-send--handlers'.
@@ -1644,6 +1725,7 @@ No state transition here since that's handled by the process sentinels."
                               start-marker))
          ;; start-marker may have been moved if :buffer was read-only
          (gptel-buffer (marker-buffer start-marker)))
+    (gptel--close-unterminated-blocks info 'completed)
     (with-current-buffer gptel-buffer
       (if (not tracking-marker)         ;Empty response
           (when gptel-mode (gptel--update-status " Empty response" 'success))
@@ -1689,6 +1771,7 @@ Perform UI updates and run post-response hooks."
            (backend-name
             (gptel-backend-name
              (buffer-local-value 'gptel-backend gptel-buffer))))
+      (gptel--close-unterminated-blocks info)
       (if (stringp error-data)
           (message "%s error: (%s) %s" backend-name status (string-trim error-data))
         (when-let* ((error-type (plist-get error-data :type)))
@@ -1721,6 +1804,7 @@ Perform UI updates and run post-response hooks."
               (start-marker (plist-get info :position))
               (tracking-marker (or (plist-get info :tracking-marker)
                                    start-marker)))
+    (gptel--close-unterminated-blocks info)
     (if-let* ((gptel-window (get-buffer-window gptel-buffer 'visible)))
         (with-selected-window gptel-window
           (mapc (lambda (f) (funcall f info)) (plist-get info :post))

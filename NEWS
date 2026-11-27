@@ -57,6 +57,17 @@
   reports the prompt to the LLM as the tool result instead, and ~ask~,
   which leaves prompts alone.
 
+- New option ~gptel-close-unterminated-blocks~, controlling what gptel
+  does with Org blocks that a response left open: =#+begin_reasoning=
+  or =#+begin_tool= when the response is aborted, times out or fails
+  before the block ends, and =#+begin_src= when a converted code fence
+  is cut off.  Such a block used to stay open, so Org -- and gptel's
+  own parsing of the buffer for the next request -- read the rest of
+  the conversation as part of it.  The default, ~t~, closes unfinished
+  blocks at the end of every response, inserting nothing when they are
+  already balanced.  ~aborted~ limits this to responses that did not
+  complete, and ~nil~ leaves the text alone.
+
 - gptel can now save and restore additional per-conversation state in
   Org buffers with the new abnormal hooks
   ~gptel-org-save-state-functions~ and
