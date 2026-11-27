@@ -1678,6 +1678,16 @@ that variable."
 ;; The next few functions are default state handlers for gptel-send, see
 ;; `gptel-send--handlers'.
 
+(defun gptel--response-inserting-p (info)
+  "Return non-nil if INFO's response is inserted into a buffer.
+
+This is the case unless the caller of `gptel-request' supplied its
+own `:callback', as `gptel-rewrite' and the `Agent' tool do.  Their
+responses are not inserted as text, so they have no insertion point
+to insert a tool call block -- or an indicator for it -- at."
+  (memq (plist-get info :callback)
+        '(gptel--insert-response gptel-curl--stream-insert-response)))
+
 (defun gptel--handle-pre-insert (fsm)
   "Tasks before inserting the LLM response for state FSM.
 
@@ -1685,8 +1695,7 @@ Handle read-only buffers and run pre-response hooks (but only if
 the request succeeded)."
   (let* ((info (gptel-fsm-info fsm))
          (start-marker (plist-get info :position)))
-    (when (memq (plist-get info :callback)
-                '(gptel--insert-response gptel-curl--stream-insert-response))
+    (when (gptel--response-inserting-p info)
       (with-current-buffer (marker-buffer start-marker)
         (when (or buffer-read-only (get-char-property start-marker 'read-only))
           (cond
@@ -1726,6 +1735,7 @@ No state transition here since that's handled by the process sentinels."
          ;; start-marker may have been moved if :buffer was read-only
          (gptel-buffer (marker-buffer start-marker)))
     (gptel--close-unterminated-blocks info 'completed)
+    (gptel--clear-tool-progress info)
     (with-current-buffer gptel-buffer
       (if (not tracking-marker)         ;Empty response
           (when gptel-mode (gptel--update-status " Empty response" 'success))
@@ -1761,6 +1771,7 @@ No state transition here since that's handled by the process sentinels."
   "Check for errors in request state FSM.
 
 Perform UI updates and run post-response hooks."
+  (gptel--clear-tool-progress (gptel-fsm-info fsm))
   (when-let* ((info (gptel-fsm-info fsm))
               (error-data (plist-get info :error)))
     (let* ((status (plist-get info :status))
@@ -1799,6 +1810,7 @@ Perform UI updates and run post-response hooks."
 
 (defun gptel--handle-abort (fsm)
   "Perform UI update on `gptel-abort' for FSM."
+  (gptel--clear-tool-progress (gptel-fsm-info fsm))
   (when-let* ((info (gptel-fsm-info fsm))
               (gptel-buffer (plist-get info :buffer))
               (start-marker (plist-get info :position))
@@ -2559,7 +2571,7 @@ USE-MINIBUFFER is non-nil)."
             (when (= (point) start-marker) (ignore-errors (backward-char))))
           (save-excursion
             (goto-char (overlay-end ov))
-            (pcase-dolist (`(,tool-spec ,arg-plist _) tool-calls)
+            (pcase-dolist (`(,tool-spec ,arg-plist _ ,_tool-call) tool-calls)
               ;; Call tool-specific confirmation prompt
               (setq arg-values (gptel--map-tool-args tool-spec arg-plist))
               (if-let* ((funcs (cdr (assoc (gptel-tool-name tool-spec)
@@ -2608,6 +2620,23 @@ USE-MINIBUFFER is non-nil)."
           (overlay-put ov 'keymap gptel-tool-call-actions-map)
           prompt-ov)))))
 
+(defvar gptel-tool-result-duration)     ;Defined with the tool indicator below
+
+(defun gptel--tool-call-duration-string (tool-call)
+  "Return how long TOOL-CALL took, formatted for a tool call block header.
+
+TOOL-CALL is the plist describing the call, see
+`gptel--tool-call-mark-start'; it is nil when gptel cannot find the
+call.  The string is empty when the duration is not wanted, see
+`gptel-tool-result-duration', or not known."
+  (let ((started (plist-get tool-call :started))
+        (finished (plist-get tool-call :finished)))
+    (when (and gptel-tool-result-duration
+               (numberp started)
+               (numberp finished))
+      (format " %s" (gptel--tool-progress-duration
+                     (max 0 (- finished started)))))))
+
 (defun gptel--display-tool-results (tool-results info)
   "Insert TOOL-RESULTS into buffer.
 
@@ -2643,11 +2672,17 @@ for tool call results.  INFO contains the state of the request."
                                  (not (eq (char-before tracking-marker) ?\n)))
                             gptel-response-separator)))
                     (tool-use
-                     ;; TODO(tool) also check args since there may be more than
-                     ;; one call/result for the same tool
-                     (cl-find-if
-                      (lambda (tu) (equal (plist-get tu :name) name))
-                      (plist-get info :tool-use)))
+                     ;; A tool can be called more than once in a message, so
+                     ;; the call is matched by its arguments as well; the name
+                     ;; alone picks the first of them, and with it the wrong
+                     ;; id and the wrong duration.
+                     (or (cl-find-if
+                          (lambda (tu) (and (equal (plist-get tu :name) name)
+                                            (equal (plist-get tu :args) args)))
+                          (plist-get info :tool-use))
+                         (cl-find-if
+                          (lambda (tu) (equal (plist-get tu :name) name))
+                          (plist-get info :tool-use))))
                     (id (plist-get tool-use :id))
                     (display-call (format "(%s %s)" name
                                           (string-trim (prin1-to-string args) "(" ")")))
@@ -2657,6 +2692,8 @@ for tool call results.  INFO contains the state of the request."
                                      (truncate-string-to-width
                                       display-call
                                       (floor (* (window-width) 0.6)) 0 nil " ...)")))
+                    (duration
+                     (gptel--tool-call-duration-string tool-use))
                     (result-final       ;Check if the results should be excluded
                      (if (or (eq gptel-include-tool-results 'call)
                              (and (eq gptel-include-tool-results 'auto)
@@ -2668,6 +2705,7 @@ for tool call results.  INFO contains the state of the request."
                     separator
                     "#+begin_tool "
                     truncated-call
+                    duration
                     (propertize
                      (org-escape-code-in-string (concat "\n" call "\n\n" result-final))
                      'gptel `(tool . ,id))
@@ -2677,7 +2715,7 @@ for tool call results.  INFO contains the state of the request."
                  (concat
                   separator
                   ;; TODO(tool) remove properties and strip instead of ignoring
-                  (propertize (format "``` tool %s" truncated-call)
+                  (propertize (format "``` tool %s%s" truncated-call duration)
                               'gptel 'ignore 'keymap gptel--markdown-block-map)
                   (propertize
                    ;; TODO(tool) escape markdown in result
@@ -2707,19 +2745,346 @@ for tool call results.  INFO contains the state of the request."
   "Format a tool call for display in the buffer.
 
 NAME and ARG-VALUES are the name and arguments for the call."
-  (format "(%s %s)\n"
-          (propertize name 'font-lock-face 'font-lock-keyword-face)
-          (propertize
-           (mapconcat (lambda (arg)
-                        (cond ((stringp arg)
-                               (prin1-to-string
-                                (replace-regexp-in-string
-                                 "\n" "⮐" (truncate-string-to-width
-                                           arg 256
-                                           nil nil t))))
-                              (t (prin1-to-string arg))))
-                      arg-values " ")
-           'font-lock-face 'font-lock-constant-face)))
+  (if (null arg-values)
+      (format "(%s)\n" (propertize name 'font-lock-face 'font-lock-keyword-face))
+    (format "(%s %s)\n"
+            (propertize name 'font-lock-face 'font-lock-keyword-face)
+            (propertize
+             (mapconcat (lambda (arg)
+                          (cond ((stringp arg)
+                                 (prin1-to-string
+                                  (replace-regexp-in-string
+                                   "\n" "⮐" (truncate-string-to-width
+                                             arg 256
+                                             nil nil t))))
+                                (t (prin1-to-string arg))))
+                        arg-values " ")
+             'font-lock-face 'font-lock-constant-face))))
+
+;;; Running tool indicator
+;;
+;; A tool call can only be reported once it has returned, so the tool call
+;; block (#+begin_tool in Org buffers) is inserted after the tool has run.
+;; The indicator below covers the gap: it shows the tool calls that are
+;; running while they run, with the time they started, how long they have been
+;; running and the limit they are subject to.  A tool call is shown twice:
+;;
+;;   1. in the confirmation prompt, `gptel--display-tool-calls', before the
+;;      call is made, and
+;;   2. in this indicator, while the call runs;
+;;
+;; and then in its result block, `gptel--display-tool-results', with the
+;; duration the call took.
+;;
+;; (1) and (2) format the call with `gptel--format-tool-call', so a call looks
+;; the same while it runs as when it was about to run: the indicator is that
+;; same line with the timing appended.
+;;
+;; The indicator is an overlay with an `after-string', so it never becomes
+;; part of the buffer text: it cannot disturb the Org block structure of the
+;; buffer, the next prompt, or gptel's stream parsing.
+(defcustom gptel-tool-progress-indicator t
+  "Whether to show the tool calls that are running in the buffer.
+
+When non-nil, gptel displays the tool calls that have not returned
+yet below the end of the response, with the time each started, how
+long it has been running and the time limit it is subject to.  Use
+this to see which tool is running: the tool call block itself is
+only inserted once the tool has returned.
+
+The indicator is an overlay, so it is not part of the buffer
+text, is not sent to the LLM, and does not affect Org block
+structure or gptel's parsing of the buffer.  It is skipped in
+buffers where `gptel-mode' is off, and for requests that do not
+insert their response into a buffer, such as `gptel-rewrite' and
+the `Agent' tool -- see `gptel--response-inserting-p'.  Nothing
+is left behind if the request fails or is aborted.
+
+See also `gptel-tool-progress-refresh-interval' and
+`gptel-tool-result-duration'."
+  :type 'boolean
+  :group 'gptel)
+
+(defcustom gptel-tool-progress-refresh-interval 0.5
+  "Seconds between refreshes of the running tool indicator.
+
+While an asynchronous tool runs, Emacs is idle and this timer
+updates the elapsed time shown for it.  A synchronous tool that
+blocks Emacs cannot be updated while it runs: the indicator then
+shows the time the call started and stands still.
+
+Set this to nil to disable the timer.  The indicator is still
+shown and updated whenever a tool call starts or finishes, and it
+then shows the elapsed time without ticking."
+  :type '(choice (number :tag "Seconds between refreshes")
+                 (const :tag "No live updates" nil))
+  :group 'gptel)
+
+(defcustom gptel-tool-result-duration t
+  "Whether to show how long each tool call took in its result block.
+
+When non-nil, the block gptel inserts after a tool call -- the
+`#+begin_tool' header in Org buffers, or the fenced block
+elsewhere -- ends with the call's duration, like
+
+    #+begin_tool (Bash :command \"npm test\") 12.4s
+
+gptel strips these header lines before sending the buffer to the
+LLM, see `gptel-org--strip-block-headers', so the duration is for
+the reader of the transcript and never reaches the model."
+  :type 'boolean
+  :group 'gptel)
+
+(defvar-local gptel--tool-progress-overlay nil
+  "Overlay showing the tool calls currently running in this buffer.")
+
+(defvar-local gptel--tool-progress-timer nil
+  "Timer refreshing the running tool indicator in this buffer.
+
+The timer is one-shot and re-arms itself, see
+`gptel--tool-progress-tick': a timer whose buffer is gone therefore
+fires once more and stops, instead of running on in the background.")
+
+(defun gptel--tool-progress-running (info)
+  "Return the tool calls in INFO that are running.
+
+These are the calls that have been dispatched -- `:started' is
+recorded just before the tool runs -- and have not delivered a
+result yet.  A call waiting for the user to confirm it is not
+running, and is not included."
+  (cl-remove-if-not
+   (lambda (tool-call)
+     (and (plist-get tool-call :started)
+          (not (plist-get tool-call :result))))
+   (plist-get info :tool-use)))
+
+(defun gptel--tool-progress-tool-spec (tool-call info)
+  "Return the tool TOOL-CALL calls in INFO, or nil if it is unknown."
+  (let ((name (plist-get tool-call :name)))
+    (cl-find-if (lambda (spec) (equal (gptel-tool-name spec) name))
+                (plist-get info :tools))))
+
+(defun gptel--tool-progress-arg-values (tool-call info)
+  "Return the argument values of TOOL-CALL to display, from INFO.
+
+Only the arguments the tool declares are shown, in declaration
+order, the same way the confirmation prompt shows them: gptel's
+universal arguments (`timeout', `max_output_chars', see
+`gptel-tool-universal-args') are not the tool's own, and the limits
+they set are reported separately."
+  (let ((args (plist-get tool-call :args)))
+    (if-let* ((spec (gptel--tool-progress-tool-spec tool-call info)))
+        (gptel--map-tool-args spec args)
+      (map-values args))))
+
+(defun gptel--tool-progress-duration (seconds)
+  "Return SECONDS, a number, as a short duration string."
+  (let ((whole (floor seconds)))
+    (cond
+     ((< seconds 10) (format "%.1fs" seconds))
+     ((< whole 60) (format "%ds" whole))
+     ((< whole 3600) (format "%dm%02ds" (/ whole 60) (% whole 60)))
+     (t (format "%dh%02dm" (/ whole 3600) (/ (% whole 3600) 60))))))
+
+(defun gptel--tool-progress-timeout (tool-call info)
+  "Return the time limit TOOL-CALL is subject to, or nil if it has none.
+
+The limit is the one recorded for the call, or, for a call that has
+not been dispatched yet, the one it would get, see
+`gptel--tool-limit'."
+  (if (plist-member tool-call :timeout)
+      (plist-get tool-call :timeout)
+    (gptel--tool-limit (gptel--tool-progress-tool-spec tool-call info)
+                       (plist-get tool-call :args) 'timeout)))
+
+(defun gptel--tool-progress-face (string)
+  "Return STRING with `font-lock-face' properties turned into `face'.
+
+`gptel--format-tool-call' propertizes its output with
+`font-lock-face', which only Font Lock turns into a face.  This
+indicator is an overlay string, which nothing fontifies, so the
+faces have to be spelled out for it.  A `face' property already on
+the text is combined with it rather than replaced."
+  (let ((pos 0)
+        (length (length string)))
+    (while (< pos length)
+      (let* ((next (or (next-single-property-change
+                        pos 'font-lock-face string length)
+                       length))
+             (face (get-text-property pos 'font-lock-face string))
+             (value (and face (get-text-property pos 'face string)))
+             (new (cond ((not face) value)
+                        ((not value) face)
+                        (t (cons face (ensure-list value))))))
+        (when new (add-face-text-property pos next new nil string))
+        (setq pos next)))
+    string))
+
+(defun gptel--tool-progress-call-string (tool-call info width)
+  "Return the line showing TOOL-CALL, truncated to WIDTH, from INFO.
+
+The call is formatted by `gptel--format-tool-call' -- the function
+the confirmation prompt uses -- so that the call looks the same
+while it runs as it did when it was about to run, and the same
+afterwards in the tool call block."
+  (gptel--tool-progress-face
+   (truncate-string-to-width
+    (string-trim
+     (gptel--format-tool-call (or (plist-get tool-call :name) "tool")
+                              (gptel--tool-progress-arg-values tool-call info)))
+    width 0 nil " ...)")))
+
+(defun gptel--tool-progress-timing-string (tool-call info)
+  "Return the start time, elapsed time and limit of TOOL-CALL, from INFO."
+  (let* ((started (plist-get tool-call :started))
+         (finished (plist-get tool-call :finished))
+         (timeout (gptel--tool-progress-timeout tool-call info))
+         (elapsed (and (numberp started)
+                       (max 0 (- (or finished (float-time)) started))))
+         (parts
+          (delq nil
+                (list (and elapsed (gptel--tool-progress-duration elapsed))
+                      (and (numberp timeout) (> timeout 0)
+                           (concat "limit "
+                                   (gptel--tool-progress-duration timeout)))
+                      (and (numberp started)
+                           (format "started %s"
+                                   (format-time-string
+                                    "%H:%M:%S" (seconds-to-time started))))))))
+    (when parts
+      (propertize (concat "  " (mapconcat #'identity parts ", "))
+                  'face 'shadow))))
+
+(defun gptel--tool-progress-string (tool-calls info)
+  "Return the indicator text for TOOL-CALLS, from INFO.
+
+Several running calls are listed one per line, indented under the
+\"Running tools:\" heading.  The width left for the call itself
+leaves room for its timing, so that the timing does not wrap."
+  (let* ((timings
+          (mapcar (lambda (tool-call)
+                    (or (gptel--tool-progress-timing-string tool-call info) ""))
+                  tool-calls))
+         (timing-width (cl-loop for timing in timings
+                                maximize (length timing)))
+         (width (max 30 (min (floor (* (window-width) 0.6))
+                             (- (window-width) timing-width 8))))
+         (lines (cl-loop for tool-call in tool-calls
+                         for timing in timings
+                         collect (concat (gptel--tool-progress-call-string
+                                          tool-call info width)
+                                         timing))))
+    (if (cdr tool-calls)
+        (concat (propertize "Running tools:" 'face 'font-lock-string-face)
+                "\n"
+                (mapconcat (lambda (line) (concat "  " line)) lines "\n"))
+      (concat (propertize "Running tool: " 'face 'font-lock-string-face)
+              (car lines)))))
+
+(defun gptel--tool-progress-target (info)
+  "Return (BUFFER . POSITION) where INFO's tool indicator should go.
+
+The response buffer is the one that `:tracking-marker' (or
+`:position') points into, which is not necessarily `:buffer': a
+read-only `:buffer' is redirected to \"*LLM response*\", see
+`gptel--handle-pre-insert'."
+  (let ((anchor (or (plist-get info :tracking-marker)
+                    (plist-get info :position))))
+    (cons (or (and (markerp anchor) (marker-buffer anchor))
+              (plist-get info :buffer))
+          (and (markerp anchor) (marker-position anchor)))))
+
+(defun gptel--tool-progress-unschedule ()
+  "Cancel the timer refreshing this buffer's tool indicator, if any."
+  (when (timerp gptel--tool-progress-timer)
+    (cancel-timer gptel--tool-progress-timer))
+  (setq gptel--tool-progress-timer nil))
+
+(defun gptel--tool-progress-schedule ()
+  "Arrange for the next refresh of this buffer's tool indicator."
+  (when (and gptel-tool-progress-refresh-interval
+             (not (timerp gptel--tool-progress-timer)))
+    (setq gptel--tool-progress-timer
+          (run-at-time gptel-tool-progress-refresh-interval nil
+                       #'gptel--tool-progress-tick (current-buffer)))))
+
+(defun gptel--tool-progress-tick (buffer)
+  "Refresh the running tool indicator in BUFFER, then schedule the next tick.
+
+Nothing is refreshed, and no further tick is scheduled, when the
+indicator is gone: the request it belonged to has ended.  That is
+what keeps a timer that outlived its request -- or its buffer --
+from bringing the indicator back."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq gptel--tool-progress-timer nil)
+      (let ((ov gptel--tool-progress-overlay))
+        (when (and (overlayp ov) (overlay-buffer ov))
+          (gptel--tool-progress-refresh (overlay-get ov 'info)))))))
+
+(defun gptel--clear-tool-progress (info)
+  "Remove the running tool call indicator shown for INFO."
+  (let ((buffer (car (gptel--tool-progress-target info))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (gptel--tool-progress-unschedule)
+        (when (overlayp gptel--tool-progress-overlay)
+          (delete-overlay gptel--tool-progress-overlay)
+          (setq gptel--tool-progress-overlay nil))))))
+
+(defun gptel--tool-progress-refresh (info)
+  "Redraw the existing tool indicator for INFO and schedule its next tick.
+
+This never creates the indicator: an indicator that is gone means
+the request it showed is over, see `gptel--update-tool-progress'."
+  (let ((tool-calls (gptel--tool-progress-running info))
+        (ov gptel--tool-progress-overlay))
+    (if (null tool-calls)
+        (gptel--clear-tool-progress info)
+      (when (and (overlayp ov) (overlay-buffer ov))
+        (overlay-put ov 'after-string
+                     (concat (unless (and (> (overlay-start ov) (point-min))
+                                          (eq (char-before (overlay-start ov))
+                                              ?\n))
+                               "\n")
+                             (gptel--tool-progress-string tool-calls info)))
+        (gptel--tool-progress-schedule)))))
+
+(defun gptel--update-tool-progress (info)
+  "Show, update or remove the running tool call indicator for INFO.
+
+The indicator lists the tool calls in INFO that are running and is
+removed once none of them is.  INFO is the `gptel-request' state
+plist, see `gptel--handle-tool-use' and `gptel--process-tool-call'."
+  (pcase-let* ((`(,buffer . ,pos) (gptel--tool-progress-target info))
+               (running (and (buffer-live-p buffer)
+                             (gptel--response-inserting-p info)
+                             (buffer-local-value 'gptel-mode buffer)
+                             (buffer-local-value 'gptel-tool-progress-indicator
+                                                 buffer)
+                             (gptel--tool-progress-running info))))
+    (cond
+     ((null running) (gptel--clear-tool-progress info))
+     (pos
+      (with-current-buffer buffer
+        (setq pos (min pos (point-max)))
+        (let ((ov (and (overlayp gptel--tool-progress-overlay)
+                       (eq (overlay-buffer gptel--tool-progress-overlay) buffer)
+                       gptel--tool-progress-overlay)))
+          (unless ov
+            (setq ov (make-overlay pos pos))
+            (setq gptel--tool-progress-overlay ov))
+          ;; The request state is how the refresh timer reaches the calls.
+          (overlay-put ov 'info info)
+          (move-overlay ov pos pos)
+          (gptel--tool-progress-refresh info))))
+     (t (gptel--clear-tool-progress info)))
+    ;; Refresh the display: synchronous tools run to completion without
+    ;; returning to the command loop, so the indicator (like the mode line
+    ;; status for the tool call) would otherwise only be shown afterwards.
+    (when (and running (buffer-live-p buffer) (get-buffer-window buffer t))
+      (with-demoted-errors "gptel tool indicator: %S"
+        (redisplay)))))
 
 (defun gptel--accept-tool-calls (&optional tool-calls ov)
   "Run pending tool-calls.
@@ -2744,22 +3109,29 @@ overlay in the query buffer."
             (propertize ")" 'face 'mode-line-emphasis)))))))
   ;; Clear the overlays first, because we need the buffer to be cleaned up
   ;; before inserting synchronous tool results.
-  (when (and (overlayp ov) (overlay-buffer ov))
-    (with-current-buffer (overlay-buffer ov)
-      (when-let* ((preview-handles (overlay-get ov 'previews)))
-        (dolist (func-to-handle preview-handles)
-          (when (car func-to-handle) (apply func-to-handle))))
-      (dolist (prompt-ov (overlay-get ov 'prompt))
-        (when-let* (((overlay-buffer prompt-ov))
-                    (inhibit-read-only t))
-          (delete-region (overlay-start prompt-ov)
-                         (overlay-end prompt-ov)))))
-    (delete-overlay ov))
-  (message "Continuing query...")
-  (cl-loop for (tool-spec arg-plist process-tool-result) in tool-calls
-           do (gptel--invoke-tool tool-spec
-                                  (gptel--map-tool-args tool-spec arg-plist)
-                                  process-tool-result)))
+  (let ((info (and (overlayp ov) (overlay-get ov 'info))))
+    (when (and (overlayp ov) (overlay-buffer ov))
+      (with-current-buffer (overlay-buffer ov)
+        (when-let* ((preview-handles (overlay-get ov 'previews)))
+          (dolist (func-to-handle preview-handles)
+            (when (car func-to-handle) (apply func-to-handle))))
+        (dolist (prompt-ov (overlay-get ov 'prompt))
+          (when-let* (((overlay-buffer prompt-ov))
+                      (inhibit-read-only t))
+            (delete-region (overlay-start prompt-ov)
+                           (overlay-end prompt-ov)))))
+      (delete-overlay ov))
+    (message "Continuing query...")
+    ;; The calls are stamped and shown one at a time: the indicator has to
+    ;; exist before the call runs, or a synchronous tool would only be shown
+    ;; after it had finished.
+    (cl-loop for (tool-spec arg-plist process-tool-result tool-call) in tool-calls
+             do (when tool-call
+                  (gptel--tool-call-mark-start tool-spec tool-call))
+                (when info (gptel--update-tool-progress info))
+                (gptel--invoke-tool tool-spec
+                                    (gptel--map-tool-args tool-spec arg-plist)
+                                    process-tool-result tool-call))))
 
 (defun gptel--reject-tool-calls (&optional _tool-calls ov)
   "Cancel pending tool-calls.
@@ -2799,7 +3171,8 @@ the request state plist."
            (msg (read-string "Reject with instructions: "
                              nil nil tool-result)))
       (plist-put info :steering-message msg)
-      (cl-loop for (_tool-spec _arg-plist process-tool-result) in tool-calls
+      (cl-loop for (_tool-spec _arg-plist process-tool-result _tool-call)
+               in tool-calls
                do (funcall process-tool-result tool-result))))
   (when (and (overlayp ov) (overlay-buffer ov))
     (with-current-buffer (overlay-buffer ov)
@@ -2961,7 +3334,7 @@ query buffer."
       (insert ";; Inspect or edit tool calls.
 ;; Adding or deleting tool calls is not supported.\n\n")
       (cl-loop for tool-spec-args-cb in tool-calls
-               for (tool-spec arg-plist _process-tool-result) = tool-spec-args-cb
+               for (tool-spec arg-plist _process-tool-result _tool-call) = tool-spec-args-cb
                with o
                for name = (gptel-tool-name tool-spec)
                for pt = (point)

@@ -64,6 +64,8 @@
 (declare-function gptel--transform-apply-preset "gptel")
 (declare-function gptel--insert-response "gptel")
 (declare-function gptel-curl--stream-insert-response "gptel")
+(declare-function gptel--update-tool-progress "gptel")
+(declare-function gptel--clear-tool-progress "gptel")
 (declare-function gptel-make-openai "gptel-openai")
 
 
@@ -1598,11 +1600,165 @@ a tool, use `gptel-make-tool', which see."
   :group 'gptel
   :type '(repeat gptel-tool))
 
+(defcustom gptel-tool-timeout 600
+  "Number of seconds to allow a single tool call to run.
+
+This limits one tool call, not the request: when it expires the
+tool is abandoned, and an error result explaining the timeout is
+sent to the LLM, which can retry with a narrower operation.  The
+request itself carries on to the next LLM turn.  Use
+`gptel-request-timeout' instead to limit the whole request.
+
+The value is deliberately generous: ten minutes covers the builds,
+test suites and sub-agent tasks that tools run in practice, while a
+tool that hangs -- an asynchronous tool that never calls its
+callback, for example -- does not park the request indefinitely.
+
+This can be overridden per tool with the `:timeout' argument to
+`gptel-make-tool', and per call by the `timeout' argument that
+gptel advertises to the LLM (see `gptel-tool-universal-args').
+
+The limit is enforced differently for the two kinds of tools.  An
+asynchronous tool is abandoned by gptel when the time is up: a
+result it delivers later is ignored.  A synchronous tool is
+interrupted with `with-timeout', which can only interrupt Emacs
+Lisp: a synchronous tool blocked inside `call-process' or a network
+wait cannot be interrupted this way, and `gptel-request-timeout' is
+the backstop for those.
+
+Set this to nil to wait indefinitely."
+  :group 'gptel
+  :type '(choice (const :tag "No limit" nil)
+                 (number :tag "Seconds")))
+
+(defcustom gptel-tool-timeout-max 3600
+  "Upper bound on the timeout a model may ask for a tool call.
+
+The `timeout' argument gptel advertises to the LLM lets the model
+shorten or lengthen the limit of a single tool call, see
+`gptel-tool-timeout'.  Values above this ceiling are clamped to it,
+so a model sending an absurd timeout cannot switch the limit off in
+practice.  An hour is long enough for any single tool call worth
+waiting for, and short enough to bound the damage of a hung call.
+
+Set this to nil for no ceiling."
+  :group 'gptel
+  :type '(choice (const :tag "No ceiling" nil)
+                 (number :tag "Seconds")))
+
+(defcustom gptel-tool-max-result-chars 20000
+  "Maximum number of characters of a tool result to send to the LLM.
+
+A longer result is truncated in `gptel--process-tool-call', with a
+notice at the end that says how long the untruncated result was and
+how to get at the rest.  The truncated text is what both the buffer
+block and the next request carry, so the two always agree.
+
+20000 characters is roughly 5000 tokens: enough for the file
+excerpts, search hits and command output tools return in practice,
+and small enough that a few large results do not fill a context
+window.
+
+This can be overridden per tool with the `:max-result-chars'
+argument to `gptel-make-tool' -- where 0 means no limit for that
+tool -- and per call by the `max_output_chars' argument gptel
+advertises to the LLM, see `gptel-tool-universal-args'.
+
+Set this to nil (or 0) to send tool results whole."
+  :group 'gptel
+  :type '(choice (const :tag "No limit" nil)
+                 (integer :tag "Characters")))
+
+(defcustom gptel-tool-max-result-chars-max 200000
+  "Upper bound on the result size a model may ask for a tool call.
+
+The `max_output_chars' argument gptel advertises to the LLM lets
+the model change the limit of a single tool call, see
+`gptel-tool-max-result-chars'.  Values above this ceiling are
+clamped to it.
+
+200000 characters is about 50000 tokens, a quarter of the context
+of a large model: more than that should be narrowed rather than
+truncated, so a model cannot raise the limit past it in one call.
+
+Set this to nil for no ceiling."
+  :group 'gptel
+  :type '(choice (const :tag "No ceiling" nil)
+                 (integer :tag "Characters")))
+
+(defcustom gptel-tool-universal-args
+  '((:name "timeout"
+     :type "integer"
+     :optional t
+     :description
+     "Seconds to allow this tool call to run before it is abandoned and reported to you as timed out.  Omit it to use the tool's own limit.")
+    (:name "max_output_chars"
+     :type "integer"
+     :optional t
+     :description
+     "Maximum number of characters of this call's result to return.  A longer result is truncated, with a notice saying how to get the rest.  Omit it to use the tool's own limit."))
+  "Arguments gptel offers to the LLM for every tool call.
+
+These are added to the argument schema of every tool, whether or
+not the tool declares them, so that the model can adjust the limits
+of a single call without a tool having to declare arguments it does
+not take.  They are stripped from the argument list before the tool
+function is called.
+
+Each entry is an argument spec in the format used by the ARGS
+argument of `gptel-make-tool', which see.  Only the arguments gptel
+itself implements can be advertised here:
+
+- \"timeout\", which overrides `gptel-tool-timeout', up to
+  `gptel-tool-timeout-max';
+- \"max_output_chars\", which overrides `gptel-tool-max-result-chars',
+  up to `gptel-tool-max-result-chars-max'.
+
+gptel adds the `:minimum' and `:maximum' keys from those limits.
+Entries for any other name are ignored, as are entries whose name
+the tool declares itself in its own ARGS: a tool argument always
+takes precedence over the universal one of the same name.
+
+Set this to nil not to advertise any of them.  The limits are still
+enforced, and a tool that declares its own arguments of these names
+keeps working."
+  :group 'gptel
+  :type '(repeat (plist :key-type symbol :value-type sexp)))
+
+;; The two limits that can be set per tool, per call and globally.  Each entry
+;; maps a KIND to a plist, which says
+;;   :arg      the argument name advertised to the LLM,
+;;   :arg-key  the keyword for that argument in a tool call's argument plist,
+;;   :key      the keyword the resolved limit is recorded under, on the tool
+;;             call plist, for display and for use when the call finishes,
+;;   :slot     the `gptel-tool' accessor for the per-tool setting,
+;;   :default  the defcustom holding the global setting,
+;;   :min      the floor for a value the model supplies,
+;;   :max-var  the defcustom holding the ceiling for it.
+;; Per-tool and global values are used as they are (0 means no limit), only
+;; values that arrive from the model are clamped.
+(defconst gptel--tool-limit-specs
+  '((timeout . (:arg "timeout" :arg-key :timeout :key :timeout
+                :slot gptel-tool-call-timeout :default gptel-tool-timeout
+                :min 1 :max-var gptel-tool-timeout-max))
+    (max-result-chars . (:arg "max_output_chars" :arg-key :max_output_chars
+                        :key :max-result-chars
+                        :slot gptel-tool-call-max-result-chars
+                        :default gptel-tool-max-result-chars
+                        :min 1000 :max-var gptel-tool-max-result-chars-max)))
+  "Description of the per-tool-call limits, see `gptel--tool-limit'.")
+
+;; The slots are called `call-timeout' and `call-max-result-chars' so that
+;; their accessors do not collide with the defcustoms that hold the global
+;; settings, `gptel-tool-timeout' and `gptel-tool-max-result-chars'.  The
+;; keywords accepted by `gptel-make-tool' are the shorter `:timeout' and
+;; `:max-result-chars', see `gptel--make-tool-internal'.
 (cl-defstruct (gptel-tool (:constructor nil)
-                          (:constructor gptel--make-tool-internal
-                                        (&key function name description args
-                                              async category confirm include
-                                              &allow-other-keys))
+                          (:constructor gptel-tool--make
+                                        (function name description args async
+                                         category confirm include
+                                         call-timeout call-max-result-chars
+                                         cancel))
                           (:copier gptel--copy-tool))
   "Struct to specify tools for LLMs to run.
 
@@ -1621,7 +1777,36 @@ feed the LLM the results.  You can add tools via
   (include t :type (choice (const :tag "Include call and result" t)
                            (const :tag "Include call only, no result" call)
                            (const :tag "Exclude" nil))
-           :documentation "Include tool call in buffer?"))
+           :documentation "Include tool call in buffer?")
+  (call-timeout nil :type (or null number function)
+                :documentation "Limit on the run time of a call, in seconds.
+nil inherits `gptel-tool-timeout'.  A function is called for each
+call to compute it.  See `gptel-make-tool', keyword :timeout.")
+  (call-max-result-chars nil :type (or null integer function)
+                         :documentation "Limit on the length of a call's result.
+nil inherits `gptel-tool-max-result-chars', 0 means no limit.  A
+function is called for each call to compute it.  See
+`gptel-make-tool', keyword :max-result-chars.")
+  (cancel nil :type (or null function)
+          :documentation "Function to stop a running call.
+Called with the value the asynchronous tool function returned when
+the call is abandoned -- because it timed out, or because its
+request ended -- so that a tool that owns a process or a buffer can
+clean it up.  See `gptel-make-tool', keyword :cancel."))
+
+(cl-defun gptel--make-tool-internal
+    (&key function name description args async category confirm (include t)
+          timeout max-result-chars cancel &allow-other-keys)
+  "Construct a `gptel-tool' from the given keyword arguments.
+
+This is an implementation detail, use `gptel-make-tool' instead.
+TIMEOUT and MAX-RESULT-CHARS are accepted under these names, but
+stored in the `call-timeout' and `call-max-result-chars' slots, see
+`gptel-tool'.  Unknown keywords are ignored, so that tools written
+against a newer gptel keep loading."
+  (gptel-tool--make function name description args async
+                    category confirm include
+                    timeout max-result-chars cancel))
 
 (defun gptel--preprocess-tool-args (spec)
   "Convert symbol :type values in tool SPEC to strings destructively."
@@ -1652,6 +1837,156 @@ feed the LLM the results.  You can add tools via
   "Construct a gptel-tool according to SPEC."
   (gptel--preprocess-tool-args (plist-get spec :args))
   (apply #'gptel--make-tool-internal spec))
+
+;;;; Per-call limits
+;; A tool call has two limits, its run time and the length of its result.  Each
+;; can be set in three places, in increasing precedence: the global defcustom,
+;; the tool's own slots, and an argument supplied by the model for this call.
+;; Only values from the model are clamped, since the user is free to set any
+;; limit they like.
+
+(defun gptel--tool-limit-spec (kind)
+  "Return the limit description for KIND, a symbol, see `gptel--tool-limit-specs'."
+  (or (alist-get kind gptel--tool-limit-specs)
+      (error "Unknown tool limit %S" kind)))
+
+(defun gptel--tool-limit-value (value)
+  "Return VALUE, calling it first if it is a function.
+
+A limit slot can hold a function, so that a tool can compute its
+limit per call from a user option, as the \"Agent\" tool in
+gptel-agent does."
+  (if (functionp value) (funcall value) value))
+
+(defun gptel--tool-limit-ceiling (kind)
+  "Return the ceiling on a model-supplied limit of KIND, or nil."
+  (when-let* ((var (plist-get (gptel--tool-limit-spec kind) :max-var)))
+    (symbol-value var)))
+
+(defun gptel--tool-limit (tool-spec args kind)
+  "Return the effective KIND limit for a call to TOOL-SPEC with ARGS.
+
+KIND is `timeout' or `max-result-chars', see
+`gptel--tool-limit-specs'.  A limit supplied by the model in ARGS
+takes precedence over the tool's own slot, which takes precedence
+over the global defcustom.  The model's value is clamped to the
+floor and ceiling for that limit; a value that is not a number is
+ignored, so that malformed input from the model cannot make the
+tool call fail.
+
+A tool slot holding a function is called to compute the limit, and
+what it returns is the limit as-is: a function returning nil means
+\"no limit\", not \"inherit the default\", since it is the tool
+deciding, as the \"Agent\" tool in gptel-agent does.
+
+Returns nil (or 0) for \"no limit\"."
+  (let* ((spec (gptel--tool-limit-spec kind))
+         (supplied (plist-get args (plist-get spec :arg-key)))
+         ;; A tool call can have no tool spec: the model asked for a tool
+         ;; gptel does not have, and that is reported to it as a result.
+         (own (and (gptel-tool-p tool-spec)
+                   (funcall (plist-get spec :slot) tool-spec))))
+    (cond
+     ((numberp supplied)
+      (let ((ceiling (gptel--tool-limit-ceiling kind)))
+        (max (plist-get spec :min)
+             (if ceiling (min ceiling supplied) supplied))))
+     ;; A tool that sets a limit, or computes one, decides it on its own.  A
+     ;; function returning nil there means "no limit", not "inherit".
+     (own (gptel--tool-limit-value own))
+     (t (gptel--tool-limit-value
+         (symbol-value (plist-get spec :default)))))))
+
+(defun gptel--tool-universal-args ()
+  "Return the universal arguments to advertise, see `gptel-tool-universal-args'.
+
+Unknown entries are dropped, so that a typo in the user's value
+cannot silently swallow an argument a tool needs.  The `:minimum'
+and `:maximum' keys are filled in from the limits gptel enforces."
+  (cl-loop for arg in gptel-tool-universal-args
+           for kind = (cl-loop for (k . spec) in gptel--tool-limit-specs
+                               when (equal (plist-get arg :name)
+                                            (plist-get spec :arg))
+                               return k)
+           when kind
+           collect (let ((arg (copy-sequence arg))
+                         (ceiling (gptel--tool-limit-ceiling kind)))
+                     (unless (plist-member arg :type)
+                       (plist-put arg :type "integer"))
+                     (unless (plist-member arg :minimum)
+                       (plist-put arg :minimum
+                                  (plist-get (gptel--tool-limit-spec kind) :min)))
+                     (when (and ceiling (not (plist-member arg :maximum)))
+                       (plist-put arg :maximum ceiling))
+                     arg)))
+
+(defun gptel--tool-universal-arg-p (name tool-spec)
+  "Return non-nil if NAME is a universal argument that TOOL-SPEC may receive.
+
+This is the case when NAME is one of the limits gptel knows, and
+the tool does not declare an argument of that name itself: a tool
+argument always wins over the universal one of the same name, so
+that existing tools keep getting the arguments they were written
+for."
+  (and (cl-loop for (_ . spec) in gptel--tool-limit-specs
+                thereis (equal name (plist-get spec :arg)))
+       (not (cl-loop for arg in (gptel-tool-args tool-spec)
+                     thereis (equal name (plist-get arg :name))))))
+
+(defun gptel--tools-with-universal-args (tools)
+  "Return TOOLS with the universal arguments added to each tool's ARGS.
+
+The tools themselves are copied, so that a schema-only addition
+does not change the tool's argument list, and therefore the shape of
+the calls it is given.  Adding the arguments twice is a no-op, which
+matters for backends that hand a call to another backend's
+`gptel--parse-tools', like =gptel--gh=."
+  (let ((universal (gptel--tool-universal-args)))
+    (mapcar
+     (lambda (tool)
+       (let ((extra (cl-remove-if
+                     (lambda (arg)
+                       (not (gptel--tool-universal-arg-p
+                             (plist-get arg :name) tool)))
+                     universal)))
+         (if (null extra) tool
+           (let ((copy (gptel--copy-tool tool)))
+             (setf (gptel-tool-args copy)
+                   (append (gptel-tool-args tool) extra))
+             copy))))
+     tools)))
+
+(defun gptel--tool-call-set-limits (tool-spec tool-call)
+  "Record the effective limits for TOOL-CALL in TOOL-CALL's plist.
+
+TOOL-SPEC is the tool being called, and TOOL-CALL the plist
+describing the call, which holds the model's arguments in its
+:args.  The limits are recorded as :timeout and :max-result-chars,
+so that the request carries the numbers it is actually using for
+UI purposes, see `gptel--call-tool'."
+  (dolist (spec gptel--tool-limit-specs)
+    (let ((key (plist-get (cdr spec) :key)))
+      (unless (plist-member tool-call key)
+        (plist-put tool-call key
+                   (gptel--tool-limit tool-spec
+                                      (plist-get tool-call :args)
+                                      (car spec)))))))
+
+(defun gptel--tool-call-mark-start (tool-spec tool-call)
+  "Record TOOL-CALL's limits and start time before it is run.
+
+TOOL-SPEC is the tool being called and TOOL-CALL the plist
+describing the call, see `gptel--tool-call-set-limits'.
+
+This is called where the call is dispatched, and by a UI that
+shows the call running -- the tool indicator in gptel does, and it
+has to render before the call is made, or a synchronous tool would
+only be shown after it had already finished.  The first stamp
+wins: a call's duration is measured from the moment it was
+dispatched, whichever of the two got there first."
+  (gptel--tool-call-set-limits tool-spec tool-call)
+  (unless (plist-member tool-call :started)
+    (plist-put tool-call :started (float-time))))
 
 (defvar gptel--known-tools nil
   "Alist of gptel tools arranged by category.
@@ -1756,6 +2091,45 @@ in chat buffers.  Possible values:
 - symbol `call': Include only the call parameters, not the result.
 - nil: Exclude the tool call from the buffer entirely.
 
+TIMEOUT: Seconds to allow a single call of this tool to run, see
+`gptel-tool-timeout'.  It can also be a function returning the number
+of seconds, called for each call, which lets the limit follow a user
+option.  nil (the default) inherits the global limit.
+
+An asynchronous tool is abandoned when it runs out of time, and
+stopped if it declares CANCEL.  A synchronous tool is interrupted
+with `with-timeout', which only fires when the tool yields to Emacs --
+waiting in `sleep-for' or `accept-process-output' -- so a tool that
+spins in Emacs Lisp, or blocks in `call-process', cannot be
+interrupted this way.  `gptel-request-timeout' is the backstop for a
+request that is stuck that way.
+
+MAX-RESULT-CHARS: Maximum number of characters of this tool's result
+to send to the LLM, see `gptel-tool-max-result-chars'.  0 means no
+limit for this tool, nil (the default) inherits the global limit.  It
+can also be a function, called for each call like TIMEOUT.
+
+The model can adjust both limits for a single call with the `timeout'
+and `max_output_chars' arguments, which gptel adds to the schema of
+every tool, see `gptel-tool-universal-args'.  A value it supplies is
+clamped to `gptel-tool-timeout-max' and
+`gptel-tool-max-result-chars-max' respectively.
+
+CANCEL: Function to stop a call that gptel abandons.  It is called
+with the value the (asynchronous) tool function returned, so a tool
+that owns a process or a buffer can clean it up when the call times
+out or its request ends.  A call is abandoned when it exceeds TIMEOUT;
+without CANCEL, gptel abandons it but cannot stop it, and it keeps
+running in the background:
+
+  (gptel-make-tool
+   :name \"shell\"
+   :async t
+   :function (lambda (callback command)
+               (make-process :name \"shell\" :command (list \"bash\" \"-c\" command)
+                             :sentinel (lambda (proc _) (funcall callback ...))))
+   :cancel (lambda (proc) (when (processp proc) (delete-process proc))))
+
 Here is an example definition:
 
   (gptel-make-tool
@@ -1789,6 +2163,9 @@ callback as its first argument, which it runs with the result:
            (alist-get category gptel--known-tools nil nil #'equal)
            nil nil #'equal)
           tool)))
+
+;; NOTE: The universal arguments (`gptel-tool-universal-args') are added by the
+;; :around method below, not by the methods themselves.
 
 (cl-defgeneric gptel--parse-tools (_backend tools)
   "Parse TOOLS and return a list of prompts.
@@ -1841,6 +2218,17 @@ implementation, used by OpenAI-compatible APIs and Ollama."
                    :additionalProperties :json-false))
           (list :parameters (list :type "object" :properties nil))))))
     (ensure-list tools))))
+
+;; The universal arguments (`gptel-tool-universal-args') are added in an
+;; :around method rather than in each backend's method, or at each call site of
+;; this generic function.  Every backend -- including one written later, outside
+;; gptel -- has to define a primary method, and an :around method applies to all
+;; of them, so no backend can forget to advertise the universal arguments.  This
+;; also leaves the tool structs untouched: the schema gains the extra arguments,
+;; while the tool's own ARGS still decide what its function is called with.
+(cl-defmethod gptel--parse-tools :around (backend tools)
+  "Add the universal arguments to the schema of every tool in TOOLS."
+  (cl-call-next-method backend (gptel--tools-with-universal-args tools)))
 
 (cl-defgeneric gptel--parse-tool-results (backend results)
   "Return a BACKEND appropriate prompt containing tool call RESULTS.
@@ -1977,13 +2365,34 @@ state machine and driven by it."
 MACHINE is an instance of `gptel-fsm'.
 
 The next state is NEW-STATE if given.  Otherwise it is determined
-automatically from MACHINE's transition table."
+automatically from MACHINE's transition table.
+
+If no next state can be determined, the state is left unchanged.
+This is the case for the terminal states (ERRS, ABRT and DONE),
+which have no entry in the transition table: a finished request must
+stay finished.  Assigning nil to the state here instead would make
+`gptel--fsm-live-p' report a live request for a dead one, which lets
+`gptel-send--steer' and the transient act on it."
   (unless new-state (setq new-state (gptel--fsm-next machine)))
-  (push (gptel-fsm-state machine)
-        (plist-get (gptel-fsm-info machine) :history))
-  (setf (gptel-fsm-state machine) new-state)
-  (when-let* ((handlers (alist-get new-state (gptel-fsm-handlers machine))))
-    (mapc (lambda (h) (funcall h machine)) handlers)))
+  (cond
+   ((null new-state)
+    (when gptel-log-level
+      (gptel--log (format "No transition out of state %S, state unchanged."
+                          (gptel-fsm-state machine))
+                  "fsm" t)))
+   (t
+    (push (gptel-fsm-state machine)
+          (plist-get (gptel-fsm-info machine) :history))
+    (setf (gptel-fsm-state machine) new-state)
+    (when-let* ((handlers (alist-get new-state (gptel-fsm-handlers machine))))
+      (mapc (lambda (h) (funcall h machine)) handlers))
+    ;; A request that has ended will no longer deliver the results of the tool
+    ;; calls it had running, so their timeout timers are dead weight.  They are
+    ;; cancelled here rather than in each terminal handler, so that every state
+    ;; machine gptel runs -- including the one `gptel-rewrite' uses, which has no
+    ;; terminal handlers -- is covered.
+    (when (gptel--request-ended-p machine)
+      (gptel--cancel-tool-timers (gptel-fsm-info machine))))))
 
 (defun gptel--fsm-next (machine)
   "Determine MACHINE's next state according to its transition table.
@@ -2000,6 +2409,44 @@ MACHINE is an instance of `gptel-fsm'"
 ;;;; State machine handlers
 ;; The next few functions are default state handlers for gptel's state machine,
 ;; see `gptel-request--handlers'.
+
+(defsubst gptel--request-ended-p (fsm)
+  "Return non-nil if FSM's request has ended, one way or another.
+
+The terminal states are ERRS (the request failed), ABRT (it was
+aborted or timed out) and DONE (it finished).  A request in a
+terminal state must not run tools, inject results or transition
+further: an asynchronous tool can deliver its result long after the
+request that started it has ended."
+  (memq (gptel-fsm-state fsm) '(ERRS ABRT DONE)))
+
+(defun gptel--abandon-tool-call (tool-call)
+  "Stop TOOL-CALL: cancel its timeout timer and cancel the run itself.
+
+Cancelling the run means calling the tool's `cancel' function, if it
+has one, with the handle the tool function returned, see
+`gptel-tool-cancel'.  A tool without one keeps running: gptel can
+abandon such a call, but not stop it."
+  (when-let* ((timer (plist-get tool-call :timer)))
+    (when (timerp timer) (cancel-timer timer))
+    (plist-put tool-call :timer nil))
+  (when-let* ((cancel (plist-get tool-call :cancel))
+              ((functionp cancel))
+              (handle (plist-get tool-call :handle)))
+    (with-demoted-errors "gptel: could not stop a tool call: %S"
+      (funcall cancel handle))
+    (plist-put tool-call :handle nil)))
+
+(defun gptel--cancel-tool-timers (info)
+  "Stop the tool calls still running in INFO.
+
+This cancels their timeout timers and, for tools that support it,
+the calls themselves, see `gptel--abandon-tool-call'.  It runs when
+a request ends: nothing will collect those results any more."
+  (when (listp info)
+    (dolist (tool-call (plist-get info :tool-use))
+      (when (or (plist-get tool-call :timer) (plist-get tool-call :handle))
+        (gptel--abandon-tool-call tool-call)))))
 
 (defun gptel--handle-wait (fsm)
   "Fire the request contained in state machine FSM's info."
@@ -2018,6 +2465,37 @@ MACHINE is an instance of `gptel-fsm'"
     (with-current-buffer (plist-get req-info :buffer)
       (run-hooks 'gptel-post-request-hook))))
 
+(defun gptel--tool-truncation-notice (limit total)
+  "Return the notice appended to a tool result truncated at LIMIT of TOTAL chars.
+
+The notice travels with the result: the buffer block, the callback
+and the next request all show the truncated text, so it has to say
+what happened and how the model can get the rest.  It is a single
+line, and the buffer body it lands in is later passed through
+`org-escape-code-in-string', which only escapes lines starting with
+`*' or `#' (and a `,' before them), so it survives intact."
+  (let ((ceiling (gptel--tool-limit-ceiling 'max-result-chars)))
+    (format "\n\n... [gptel: result truncated at %d of %d characters.  \
+Re-run with a narrower scope (head/tail/grep filtering, or Read with a line \
+range), or pass max_output_chars to raise the limit%s.]"
+            limit total
+            (if ceiling (format " up to %d" ceiling)
+              " (see `gptel-tool-max-result-chars')"))))
+
+(defun gptel--truncate-tool-result (tool-call result)
+  "Truncate RESULT for TOOL-CALL to its effective limit, with a notice.
+
+The limit was recorded on TOOL-CALL by `gptel--tool-call-set-limits'.
+RESULT, a string, is cut on a character boundary and stays valid
+UTF-8, since it has already been through
+`gptel--sanitize-raw-bytes'."
+  (let ((limit (plist-get tool-call :max-result-chars))
+        (total (length result)))
+    (if (or (not (numberp limit)) (<= limit 0) (<= total limit))
+        result
+      (concat (substring result 0 limit)
+              (gptel--tool-truncation-notice limit total)))))
+
 (defun gptel--process-tool-call (fsm tool-spec tool-call result)
   "Add tool RESULT to a TOOL-CALL and transition FSM if required.
 
@@ -2025,24 +2503,52 @@ TOOL-CALL is a plist with the tool :name, :args and other metadata.
 TOOL-SPEC is the `gptel-tool' object, and FSM is the request state.
 
 If all pending tool calls in the current request have finished, it
-injects the results into the prompt data and transitions the FSM."
-  (let* ((info (gptel-fsm-info fsm))
-         (tool-result-alist (plist-get info :tool-result))
-         ;; MAYBE(tool-hooks): Use plist-member for valid nil :result?
-         (remaining (cl-loop for call in (plist-get info :tool-use)
-                             count (not (plist-get call :result)))))
-    (let ((result (gptel--sanitize-raw-bytes (gptel--to-string result))))
-      ;; FIXME(tool-hooks): If a hook has changed the tool that was called
-      ;; tool-spec needs to be updated.
-      (push (list tool-spec (plist-get tool-call :args) result)
-            tool-result-alist)
-      (plist-put info :tool-result tool-result-alist) ;for the callback
-      ;; NOTE: tool-call is a member of (plist-get info :tool-use), so :tool-use
-      ;; is modified by side effect.
-      ;; FIXME: Make the implicit addition to :tool-use explicit
-      (plist-put tool-call :result result)) ;for the LLM
-    ;; All tools have run
-    (when (<= (cl-decf remaining) 0) (gptel--fsm-transition fsm))))
+injects the results into the prompt data and transitions the FSM.
+
+RESULT is truncated to the effective limit for the call, see
+`gptel-tool-max-result-chars'.  Truncating here, and only here, keeps
+the buffer block, the callback and the next request in agreement,
+since all three carry this result.  The call also records its
+:started, :finished, :timeout and :max-result-chars for display."
+  (if (gptel--request-ended-p fsm)
+      ;; An asynchronous tool can deliver its result after the request that
+      ;; started it has ended -- aborted, timed out or completed.  Such a
+      ;; delivery must not inject a result or transition the machine: the
+      ;; request is over, and its state has to stay terminal.
+      (when gptel-log-level
+        (gptel--log (format "Ignoring late result for tool \"%s\": request \
+has ended with state %S."
+                            (plist-get tool-call :name) (gptel-fsm-state fsm))
+                    "late tool result" t))
+    (let* ((info (gptel-fsm-info fsm))
+           (tool-result-alist (plist-get info :tool-result))
+           ;; MAYBE(tool-hooks): Use plist-member for valid nil :result?
+           (remaining (cl-loop for call in (plist-get info :tool-use)
+                               count (not (plist-get call :result)))))
+      (gptel--tool-call-set-limits tool-spec tool-call)
+      (let ((result (gptel--truncate-tool-result
+                     tool-call
+                     (gptel--sanitize-raw-bytes (gptel--to-string result)))))
+        (plist-put tool-call :finished (float-time))
+        ;; FIXME(tool-hooks): If a hook has changed the tool that was called
+        ;; tool-spec needs to be updated.
+        (push (list tool-spec (plist-get tool-call :args) result)
+              tool-result-alist)
+        (plist-put info :tool-result tool-result-alist) ;for the callback
+        ;; NOTE: tool-call is a member of (plist-get info :tool-use), so :tool-use
+        ;; is modified by side effect.
+        ;; FIXME: Make the implicit addition to :tool-use explicit
+        (plist-put tool-call :result result)) ;for the LLM
+      ;; Drop the call from the running tool indicator, if one is shown.  Do
+      ;; this before the FSM transition below, which inserts the tool result
+      ;; block at the position the indicator is anchored to.
+      ;;
+      ;; The indicator itself is part of gptel's buffer UI, which
+      ;; `gptel-request' does not need to be loaded with.
+      (when (fboundp 'gptel--update-tool-progress)
+        (gptel--update-tool-progress info))
+      ;; All tools have run
+      (when (<= (cl-decf remaining) 0) (gptel--fsm-transition fsm)))))
 
 (defun gptel--tool-call-error-string (err)
   "Return a tool result string describing the error ERR.
@@ -2061,7 +2567,18 @@ whether or not they complete synchronously."
               "available.")
     (mapconcat #'gptel--to-string err " ")))
 
-(defun gptel--call-tool (tool-spec arg-values deliver)
+(defun gptel--tool-timeout-string (name timeout)
+  "Return the tool result string reporting that tool NAME timed out at TIMEOUT.
+
+A timeout is reported to the LLM as the result of the tool call, not
+as a signal and not as an aborted request, so that it can retry
+differently in the next turn."
+  (format "Error: tool \"%s\" timed out after %s seconds and was \
+abandoned; partial output is not available. Retry with a narrower command or \
+a shorter operation, or pass a smaller timeout / split the work."
+          name timeout))
+
+(cl-defun gptel--call-tool (tool-spec arg-values deliver &optional tool-call)
   "Call TOOL-SPEC with ARG-VALUES, delivering the outcome to DELIVER.
 
 DELIVER is called with the result of the call.  For an asynchronous
@@ -2072,12 +2589,86 @@ with the return value here.
 A signal from the tool is passed to DELIVER as an error string instead
 of being allowed to propagate: tool functions are called from gptel's
 process filter, where a signal would abort the filter and leave the
-request waiting in the TOOL state forever."
-  (condition-case err
-      (if (gptel-tool-async tool-spec)
-          (apply (gptel-tool-function tool-spec) deliver arg-values)
-        (funcall deliver (apply (gptel-tool-function tool-spec) arg-values)))
-    (error (funcall deliver (gptel--tool-call-error-string err)))))
+request waiting in the TOOL state forever.
+
+The call is limited in time by the :timeout recorded on TOOL-CALL, see
+`gptel-tool-timeout'.
+
+- An asynchronous tool that has not delivered by then is abandoned: a
+  timeout result is delivered to DELIVER, and whatever the tool
+  delivers later is ignored.  This is the case even if the request
+  itself was aborted in the meantime, see `gptel--process-tool-call'.
+  The call is also stopped, if the tool knows how: its `cancel'
+  function is called with the handle the tool function returned, see
+  `gptel-tool-cancel'.  A tool without one keeps running in the
+  background, its result unread.
+- A synchronous tool is interrupted with `with-timeout', which only
+  fires when the tool gives Emacs a chance to run timers: a tool
+  waiting in `sleep-for', `accept-process-output' or a network wait is
+  interrupted, but one that spins in Emacs Lisp, like a runaway
+  `(while t)' in a tool that evaluates code, cannot be.  Emacs itself
+  is blocked in that case, and only `C-g' recovers.
+
+The timer is cancelled on every path, including when the request is
+aborted, see `gptel--cancel-tool-timers'."
+  (let* ((name (gptel-tool-name tool-spec))
+         (timeout (if tool-call
+                      (plist-get tool-call :timeout)
+                    ;; Called without the call plist, e.g. by a caller that
+                    ;; kept the older (tool args callback) form: resolve the
+                    ;; limit from the tool itself, so the call is still timed.
+                    (gptel--tool-limit tool-spec nil 'timeout)))
+         (asyncp (gptel-tool-async tool-spec))
+         (timed (and (numberp timeout) (> timeout 0)))
+         (delivered nil)
+         (timer nil)
+         (handle nil)
+         (finish (lambda (&rest result)
+                   "Deliver RESULT to DELIVER, at most once."
+                   (unless delivered
+                     (setq delivered t)
+                     (when (timerp timer) (cancel-timer timer))
+                     (when tool-call (plist-put tool-call :timer nil))
+                     (apply deliver result))))
+         (start (lambda ()
+                  "Run the asynchronous tool, keeping the handle it returns."
+                  (setq handle (apply (gptel-tool-function tool-spec)
+                                      finish arg-values))
+                  (when tool-call
+                    (plist-put tool-call :handle handle)
+                    (plist-put tool-call :cancel (gptel-tool-cancel tool-spec)))
+                  handle))
+         (on-timeout (lambda ()
+                       "Abandon the call and report the timeout."
+                       (unless delivered
+                         (when tool-call
+                           (plist-put tool-call :timed-out t)
+                           ;; A timeout is an error result, so that backends
+                           ;; that distinguish the two (Anthropic) mark it as
+                           ;; such.
+                           (plist-put tool-call :error t))
+                         (funcall finish (gptel--tool-timeout-string
+                                          name timeout))
+                         ;; Stop what the tool left running, if it can be
+                         ;; stopped.  Its own late delivery is ignored above.
+                         (when-let* ((cancel (gptel-tool-cancel tool-spec)))
+                           (when tool-call
+                             (gptel--abandon-tool-call
+                              (list :handle handle :cancel cancel))))))))
+    (condition-case err
+        (cond
+         ((not timed)
+          (if asyncp
+              (funcall start)
+            (funcall finish (apply (gptel-tool-function tool-spec) arg-values))))
+         (asyncp
+          (setq timer (run-at-time timeout nil on-timeout))
+          (when tool-call (plist-put tool-call :timer timer))
+          (funcall start))
+         (t                              ;Synchronous, interruptible
+          (with-timeout (timeout (funcall on-timeout))
+            (funcall finish (apply (gptel-tool-function tool-spec) arg-values)))))
+      (error (funcall finish (gptel--tool-call-error-string err))))))
 
 (defvar gptel--tool-call-approve-prompts nil
   "Non-nil while a tool call runs under the `approve' prompt policy.
@@ -2171,19 +2762,27 @@ hanging Emacs."
         (read-char-choice-use-read-key nil))
     (funcall func)))
 
-(defun gptel--invoke-tool (tool-spec arg-values deliver)
+(defun gptel--invoke-tool (tool-spec arg-values deliver &optional tool-call)
   "Invoke TOOL-SPEC with ARG-VALUES, delivering the outcome to DELIVER.
 
 DELIVER is called with the result of the tool call, see
 `gptel--call-tool'.
 
+TOOL-CALL, when given, is the plist describing this call, whose :args
+carry the model's arguments.  The effective :timeout and
+:max-result-chars of the call are resolved and recorded on it, along
+with its :started time if it has none, so the request carries the
+numbers it is actually using, and so that a late result can be
+truncated and reported correctly.
+
 User prompts a tool might raise are handled according to
 `gptel-tool-call-prompt-policy', which see: they are answered, made
 to signal, or left alone."
+  (when tool-call (gptel--tool-call-mark-start tool-spec tool-call))
   (pcase gptel-tool-call-prompt-policy
     ('approve
      (gptel--call-with-approved-prompts
-      (lambda () (gptel--call-tool tool-spec arg-values deliver))))
+      (lambda () (gptel--call-tool tool-spec arg-values deliver tool-call))))
     ('inhibit
      ;; `read-key' is exempt from `inhibit-interaction', so the options that
      ;; make `y-or-n-p' and `read-char-choice' read a raw key instead of
@@ -2193,84 +2792,115 @@ to signal, or left alone."
            (use-dialog-box nil)
            (y-or-n-p-use-read-key nil)
            (read-char-choice-use-read-key nil))
-       (gptel--call-tool tool-spec arg-values deliver)))
-    (_ (gptel--call-tool tool-spec arg-values deliver))))
+       (gptel--call-tool tool-spec arg-values deliver tool-call)))
+    (_ (gptel--call-tool tool-spec arg-values deliver tool-call))))
+
+(defun gptel--log-ended-request (fsm &optional what)
+  "Log that WHAT arrived for FSM's request, which has already ended.
+
+Such an arrival is an asynchronous tool delivering its result, or a
+tool call being dispatched, after the request was aborted, timed out
+or completed.  It is ignored, see `gptel--process-tool-call'."
+  (when gptel-log-level
+    (gptel--log (format "Ignoring late %s: the request ended in state %S."
+                        (or what "event") (gptel-fsm-state fsm))
+                "late tool event" t)))
 
 (defun gptel--handle-tool-use (fsm)
   "Run tool calls captured in FSM, and advance the state machine with the results."
-  (if-let* ((info (gptel-fsm-info fsm))
-            (backend (plist-get info :backend))
-            ;; This function might run many times, so only act on the remaining tool calls.
-            (tool-use (cl-remove-if (lambda (tc) (plist-get tc :result))
-                                    (plist-get info :tool-use))))
-      (with-current-buffer (plist-get info :buffer)
-        (let ((pending-calls))
-          (mapc                         ; Construct function calls
-           (lambda (tool-call)
-             (letrec ((args (plist-get tool-call :args))
-                      (name (plist-get tool-call :name))
-                      (tool-spec (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) name))
-                                             (plist-get info :tools)))
-                      (process-tool-result (apply-partially #'gptel--process-tool-call
-                                                            fsm tool-spec tool-call)))
-               (if (null tool-spec)
-                   (if (equal name gptel--ersatz-json-tool) ;Could be a JSON response
-                       (progn   ;Handle structured JSON output supplied as tool call
-                         (funcall (plist-get info :callback)
-                                  (gptel--json-encode (plist-get tool-call :args)) info)
-                         (plist-put info :tool-use ;Remove this tool call from the list
-                                    (cl-remove-if (lambda (tc) (equal (plist-get tc :name)
+  (if (gptel--request-ended-p fsm)
+      ;; A tool call reaching here after the request has ended must not be run:
+      ;; nothing would deliver its result, and the state has to stay terminal.
+      ;; Only a late delivery gets here, see `gptel--process-tool-call'.
+      (gptel--log-ended-request fsm "tool call")
+    (if-let* ((info (gptel-fsm-info fsm))
+              (backend (plist-get info :backend))
+              ;; This function might run many times, so only act on the remaining tool calls.
+              (tool-use (cl-remove-if (lambda (tc) (plist-get tc :result))
+                                      (plist-get info :tool-use))))
+        (with-current-buffer (plist-get info :buffer)
+          (let ((pending-calls))
+            (mapc                       ; Construct function calls
+             (lambda (tool-call)
+               (letrec ((args (plist-get tool-call :args))
+                        (name (plist-get tool-call :name))
+                        (tool-spec (cl-find-if (lambda (ts) (equal (gptel-tool-name ts) name))
+                                               (plist-get info :tools)))
+                        (process-tool-result (apply-partially #'gptel--process-tool-call
+                                                              fsm tool-spec tool-call)))
+                 (if (null tool-spec)
+                     (if (equal name gptel--ersatz-json-tool) ;Could be a JSON response
+                         (progn ;Handle structured JSON output supplied as tool call
+                           (funcall (plist-get info :callback)
+                                    (gptel--json-encode (plist-get tool-call :args)) info)
+                           (plist-put info :tool-use ;Remove this tool call from the list
+                                      (cl-remove-if (lambda (tc) (equal (plist-get tc :name)
                                                                  gptel--ersatz-json-tool))
-                                                  (plist-get info :tool-use)))
-                         (when (plist-get info :stream)
-                           (funcall (plist-get info :callback) t info)))
-		     (message "Unknown tool called by model: %s" name)
-                     (funcall process-tool-result
-                              (format "Error: Tool '%s' is not available. Available tools: %s"
-                                      name (mapconcat #'gptel-tool-name
-                                                      (plist-get info :tools) ", "))))
-                 (let ((confirm))       ;Check if tool requires confirmation
-                   (cond    ;:confirm in tool-call (from hooks) takes precedence
-                    ((and-let* ((call-confirm (plist-member tool-call :confirm)))
-                       (prog1 t (setq confirm (cadr call-confirm)))))
-                    ((and gptel-confirm-tool-calls ;global and tool-specific setting
-                          (or (eq gptel-confirm-tool-calls t) ;always confirm, or
-                              (and-let* ((confirm (gptel-tool-confirm tool-spec)))
-                                (or (not (functionp confirm))
-                                    (apply confirm (gptel--map-tool-args tool-spec args))))))
-                     (setq confirm t)))
-                   (cond
-                    ;; Confirmation needs the user, who cannot be reached from
-                    ;; here.  Report the reason to the LLM instead of blocking
-                    ;; on a prompt inside a process filter.
-                    ((and confirm inhibit-interaction)
-                     (funcall process-tool-result
-                              (concat "Error: Tool '" name "' requires confirmation "
-                                      "from the user, but interaction is inhibited "
-                                      "in this session.  Do not call tools that "
-                                      "need confirmation.")))
-                    ;; To send to callback for confirmation
-                    (confirm (push (list tool-spec args process-tool-result) pending-calls))
-                    ;; Run the tool
-                    (t (gptel--invoke-tool tool-spec (gptel--map-tool-args tool-spec args)
-                                           process-tool-result)))))))
-           tool-use)
-          (when pending-calls
-            (plist-put info :tool-pending t)
-            (funcall (plist-get info :callback)
-                     (cons 'tool-call pending-calls) info))))
-    ;; No tool calls left to run: either there are none, or they have all been
-    ;; run already (e.g. by a `gptel-pre-tool-call-functions' hook that supplied
-    ;; a :result).  `gptel--process-tool-call' transitions the FSM as each call
-    ;; finishes, so without a transition here the request would stall in the
-    ;; TOOL state forever.
-    (gptel--fsm-transition fsm)))
+                                                    (plist-get info :tool-use)))
+                           (when (plist-get info :stream)
+                             (funcall (plist-get info :callback) t info)))
+		       (message "Unknown tool called by model: %s" name)
+                       (funcall process-tool-result
+                                (format "Error: Tool '%s' is not available. Available tools: %s"
+                                        name (mapconcat #'gptel-tool-name
+                                                        (plist-get info :tools) ", "))))
+                   (let ((confirm))     ;Check if tool requires confirmation
+                     (cond  ;:confirm in tool-call (from hooks) takes precedence
+                      ((and-let* ((call-confirm (plist-member tool-call :confirm)))
+                         (prog1 t (setq confirm (cadr call-confirm)))))
+                      ((and gptel-confirm-tool-calls ;global and tool-specific setting
+                            (or (eq gptel-confirm-tool-calls t) ;always confirm, or
+                                (and-let* ((confirm (gptel-tool-confirm tool-spec)))
+                                  (or (not (functionp confirm))
+                                      (apply confirm (gptel--map-tool-args tool-spec args))))))
+                       (setq confirm t)))
+                     (cond
+                      ;; Confirmation needs the user, who cannot be reached from
+                      ;; here.  Report the reason to the LLM instead of blocking
+                      ;; on a prompt inside a process filter.
+                      ((and confirm inhibit-interaction)
+                       (funcall process-tool-result
+                                (concat "Error: Tool '" name "' requires confirmation "
+                                        "from the user, but interaction is inhibited "
+                                        "in this session.  Do not call tools that "
+                                        "need confirmation.")))
+                      ;; To send to callback for confirmation.  The tool call
+                      ;; plist travels with the call so that its limits can be
+                      ;; resolved and recorded when it is finally run, see
+                      ;; `gptel--accept-tool-calls'.
+                      (confirm (push (list tool-spec args process-tool-result tool-call)
+                                     pending-calls))
+                      ;; Run the tool
+                      (t (gptel--tool-call-mark-start tool-spec tool-call)
+                         (when (fboundp 'gptel--update-tool-progress)
+                           (gptel--update-tool-progress info))
+                         (gptel--invoke-tool
+                          tool-spec (gptel--map-tool-args tool-spec args)
+                          process-tool-result tool-call)))))))
+             tool-use)
+            (when pending-calls
+              (plist-put info :tool-pending t)
+              (funcall (plist-get info :callback)
+                       (cons 'tool-call pending-calls) info))))
+      ;; No tool calls left to run: either there are none, or they have all been
+      ;; run already (e.g. by a `gptel-pre-tool-call-functions' hook that supplied
+      ;; a :result).  `gptel--process-tool-call' transitions the FSM as each call
+      ;; finishes, so without a transition here the request would stall in the
+      ;; TOOL state forever.
+      (gptel--fsm-transition fsm))))
 
 (defun gptel--map-tool-args (tool-spec args)
   "Create a tool call argument list from TOOL-SPEC and ARGS.
 
 TOOL-SPEC is a `gptel-tool' and ARGS is a plist of arguments for a tool
-call.  The argument list is suitable for supplying to the tool function."
+call.  The argument list is suitable for supplying to the tool function.
+
+Only the arguments in TOOL-SPEC's own ARGS are collected, in that
+order.  ARGS can also carry the universal arguments gptel advertises,
+`timeout' and `max_output_chars' (see `gptel-tool-universal-args'), or
+anything else the model added: they are consumed by gptel and never
+reach the tool function, which has a fixed arity.  A tool that declares
+one of those names in its own ARGS gets it here as usual."
   (mapcar
    (lambda (arg)
      (let ((key (intern (concat ":" (plist-get arg :name)))))
@@ -2281,18 +2911,23 @@ call.  The argument list is suitable for supplying to the tool function."
   "Handle the results of tool execution in FSM.
 
 Inject tool results into into the prompt data (for the LLM), run the
-callback (for the user), and transition the request state."
-  (let ((info (gptel-fsm-info fsm)))
-    (gptel--inject-prompt
-     (plist-get info :backend) (plist-get info :data)
-     (gptel--parse-tool-results (plist-get info :backend)
-                                (plist-get info :tool-use)))
-    (funcall (plist-get info :callback)
-             (cons 'tool-result (plist-get info :tool-result)) info))
-  (gptel--fsm-transition fsm))
+callback (for the user), and transition the request state.
+
+Nothing is done if the request has already ended: the results would
+be injected into a conversation that is no longer being continued."
+  (unless (gptel--request-ended-p fsm)
+    (let ((info (gptel-fsm-info fsm)))
+      (gptel--inject-prompt
+       (plist-get info :backend) (plist-get info :data)
+       (gptel--parse-tool-results (plist-get info :backend)
+                                  (plist-get info :tool-use)))
+      (funcall (plist-get info :callback)
+               (cons 'tool-result (plist-get info :tool-result)) info))
+    (gptel--fsm-transition fsm)))
 
 (defun gptel--handle-post (fsm)
   "Run cleanup for `gptel-request' with FSM."
+  (gptel--clear-tool-progress (gptel-fsm-info fsm))
   (when-let* ((info (gptel-fsm-info fsm))
               (post (plist-get info :post)))
     (mapc (lambda (f) (funcall f info)) post)))

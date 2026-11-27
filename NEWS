@@ -57,6 +57,108 @@
   reports the prompt to the LLM as the tool result instead, and ~ask~,
   which leaves prompts alone.
 
+- New option ~gptel-tool-progress-indicator~, non-nil by default.
+  gptel now shows the tool calls that are still running below the end
+  of the response, instead of leaving the tool call invisible until its
+  result block (=#+begin_tool=, or the Markdown equivalent) is inserted.
+  Each running call is shown with the time it started, how long it has
+  been running and the time limit it is subject to:
+
+  #+begin_src
+  Running tool: (Bash :command "npm test")  12s, limit 10m00s, started 10:42:07
+  #+end_src
+
+  A call is formatted with the same function that formats it in the
+  confirmation prompt, so it looks the same before and while it runs.
+  A synchronous tool that blocks Emacs is shown as it starts and stands
+  still, since nothing can run meanwhile.
+
+  The indicator is an overlay, so it is not part of the buffer text: it
+  is not sent to the LLM and cannot affect Org block structure or
+  gptel's parsing of the buffer.  Nothing is left behind if the request
+  fails or is aborted.
+
+- New option ~gptel-tool-progress-refresh-interval~, 0.5 seconds by
+  default, refreshing the elapsed time of the running tools while an
+  asynchronous one runs.  Set it to nil to stop the clock.
+
+- New option ~gptel-tool-result-duration~, non-nil by default, which
+  ends the tool call block with how long the call took:
+
+  #+begin_src
+  #+begin_tool (Bash :command "npm test") 12.4s
+  #+end_tool
+  #+end_src
+
+  These header lines are stripped before the buffer is sent to the LLM,
+  see ~gptel-org--strip-block-headers~, so the duration is for the
+  reader of the transcript only.
+
+- A tool can be called more than once in one message; gptel now matches
+  the call to its result by its arguments as well as its name.  Matching
+  by name alone could attach a result -- and with it the wrong tool call
+  id and duration -- to the first call of that tool.
+
+- New option ~gptel-tool-timeout~, non-nil by default (600 seconds).
+  It limits a single tool call, not the request: a tool that has not
+  returned by then is abandoned, and the timeout is reported to the LLM
+  as the result of the call, so it can retry with a narrower operation
+  in the next turn.  The request itself carries on.  Ten minutes is
+  long enough for the builds, test suites and sub-agent tasks tools run
+  in practice, and short enough that a hung tool -- say an asynchronous
+  tool that never calls its callback, which used to park the request in
+  the =TOOL= state forever -- does not stall the conversation.
+
+  An asynchronous tool is abandoned by gptel, and a result it delivers
+  later is ignored.  A synchronous tool is interrupted with
+  =with-timeout=, which only fires while the tool is yielding to Emacs
+  -- waiting in =sleep-for= or =accept-process-output=.  A tool that
+  spins in Emacs Lisp, or blocks in =call-process=, cannot be
+  interrupted this way: Emacs itself is stuck, and only =C-g= recovers.
+  ~gptel-request-timeout~ is the backstop for the request in that case.
+
+  The limit can be set per tool with the new =:timeout= argument to
+  ~gptel-make-tool~ (a number, or a function returning one, called per
+  call), and per call by the model, see below.
+
+- New =:cancel= argument to ~gptel-make-tool~.  A tool that owns a
+  process or a buffer can now be stopped, not just abandoned: when a
+  call times out, or its request ends, gptel calls this function with
+  the value the tool function returned.  Without it a tool that missed
+  its limit kept running in the background, its result unread -- a
+  shell command waiting for input, for example, would hold its process
+  and output buffer until Emacs exited.  The "Bash" tool in
+  gptel-agent uses it.
+
+- New option ~gptel-tool-max-result-chars~, 20000 by default.  Longer
+  tool results are truncated before they are sent to the LLM, with a
+  notice at the end saying how long the full result was and how to get
+  at the rest.  Truncation happens once, in ~gptel--process-tool-call~,
+  so the block inserted into the buffer and the payload sent on the
+  next turn always agree.  Set it per tool with the new
+  =:max-result-chars= argument to ~gptel-make-tool~ (where 0 means no
+  limit), or per call, see below.
+
+- New option ~gptel-tool-universal-args~, which adds optional =timeout=
+  and =max_output_chars= arguments to the schema of every tool gptel
+  sends, so that the model can shorten (or lengthen) the limits of a
+  single call without any tool having to declare arguments it does not
+  take.  They are stripped from the argument list before the tool
+  function is called, so tool functions keep their arity; a tool that
+  declares an argument of the same name keeps its own.  Values supplied
+  by the model are clamped to the new options ~gptel-tool-timeout-max~
+  and ~gptel-tool-max-result-chars-max~ (an hour and 200000 characters
+  by default), so a model cannot switch the limits off in one call.
+  Set ~gptel-tool-universal-args~ to nil not to advertise them.
+
+- Tool calls no longer run, and their results are no longer injected,
+  after the request that started them has ended.  A tool call that
+  arrived for a finished request used to leave the request state
+  machine in a live-looking state (the state became nil), so
+  ~gptel-send--steer~ and the transient acted on a dead request.
+  Tool calls also carry their =:started= and =:finished= times and their
+  effective limits, for display.
+
 - New option ~gptel-close-unterminated-blocks~, controlling what gptel
   does with Org blocks that a response left open: =#+begin_reasoning=
   or =#+begin_tool= when the response is aborted, times out or fails

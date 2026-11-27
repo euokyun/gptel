@@ -1472,6 +1472,8 @@ With some prompting, you can get an LLM to write these tools for you.
 
 Tools can also be asynchronous, use optional arguments and arguments with more structure (enums, arrays, objects etc).  See =gptel-make-tool= for details.
 
+gptel limits every tool call: =gptel-tool-timeout= seconds of run time (600 by default) and =gptel-tool-max-result-chars= characters of result (20000 by default).  A call that runs too long is abandoned and reported to the LLM as a timed-out result, so it can retry narrower; a longer result is truncated with a notice saying how to get the rest.  Both limits can be set per tool with the =:timeout= and =:max-result-chars= arguments to =gptel-make-tool=, and the model can adjust them for a single call with the =timeout= and =max_output_chars= arguments gptel adds to every tool's schema (see =gptel-tool-universal-args=), within the ceilings =gptel-tool-timeout-max= and =gptel-tool-max-result-chars-max=.
+
 #+html: </details>
 #+html: <details><summary>
 **** Selecting tools
@@ -1835,6 +1837,12 @@ Other Emacs clients for LLMs prescribe the format of the interaction (a comint s
 | =gptel-markdown-validate-link= | Function to validate links to include with queries             |
 | =gptel-confirm-tool-calls=     | Confirm all tool calls?                                        |
 | =gptel-include-tool-results=   | Include tool results in the LLM response?                      |
+| =gptel-tool-progress-indicator= | Show the tool calls that are still running in the buffer      |
+| =gptel-tool-progress-refresh-interval= | Seconds between updates of their elapsed time          |
+| =gptel-tool-result-duration=   | Show how long each tool call took in its result block          |
+| =gptel-tool-timeout=            | Seconds to allow a single tool call to run                    |
+| =gptel-tool-max-result-chars=   | Longest tool result to send to the LLM                        |
+| =gptel-tool-universal-args=     | Tool arguments (timeout, max_output_chars) added to every tool |
 | =gptel-use-header-line=        | Display status messages in header-line (default) or minibuffer |
 | =gptel-display-buffer-action=  | Placement of the gptel chat buffer.                            |
 |--------------------------------+----------------------------------------------------------------|
