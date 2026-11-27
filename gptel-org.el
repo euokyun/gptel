@@ -43,6 +43,9 @@
 (defvar gptel--link-type-cache)
 (defvar gptel--preset)
 (defvar so-long-action)                 ;so-long.el, Emacs 27+
+(defvar so-long-action-alist)
+(defvar so-long--active)
+(defvar so-long-mode-line-info)
 
 (defvar org-link-angle-re)
 (defvar org-link-bracket-re)
@@ -64,6 +67,8 @@
 (declare-function gptel-mode "gptel")
 (declare-function so-long "so-long" (&optional action))
 (declare-function so-long-revert "so-long" ())
+(declare-function so-long-remember-all "so-long" (&optional reset))
+(declare-function so-long-mode-line-info "so-long" ())
 (declare-function org-entry-get "org")
 (declare-function org-entry-put "org")
 (declare-function org-with-wide-buffer "org-macs" nil t)
@@ -349,6 +354,19 @@ value, so setting it locally is supported.)
 Note that `so-long' also makes the buffer read-only by default (see
 `so-long-variable-overrides'), so a session buffer that `so-long' has
 acted on is read-only until `so-long-revert' is called.
+
+A direct call to `so-long-mode' replaces the major mode without ever
+consulting `so-long-action', so it is intercepted separately, see
+`gptel-org--so-long-keep-mode'.  A session buffer therefore keeps its
+major mode however `so-long-mode' comes to be called.  (If the value
+of this option is `so-long-mode' itself, the intercept stands aside
+and the major mode is allowed to change.)
+
+None of this does anything when `global-so-long-mode' is off and
+`so-long' is never invoked by hand.  `so-long' is reachable only
+through the `set-auto-mode' and `hack-local-variables' advice that
+`global-so-long-mode' installs, so without it a session buffer keeps
+its major mode anyway and this option has nothing to do.
 
 Set this to nil to leave `so-long' entirely alone, including not
 undoing anything if it has already replaced the major mode of a
@@ -979,6 +997,81 @@ binary file keeps its raw-text reading."
     (let ((revert-without-query '("")))
       (revert-buffer-with-coding-system gptel-org-restore-coding-system t))))
 
+(defun gptel-org--so-long-apply (action)
+  "Apply `so-long' ACTION in the current buffer without changing its mode.
+
+ACTION is a key of `so-long-action-alist' whose function leaves the
+major mode alone.  This redoes what `so-long' does for an action it is
+handed, and cannot simply call `so-long' with ACTION: when
+`gptel-org--so-long-keep-mode' runs, a call to `so-long' may already be
+in progress, and `so-long' does nothing at all in that case (see
+`so-long--calling'), which would leave `so-long--active' set with no
+action behind it and make `so-long-revert' fail.
+
+Return non-nil if the action was applied."
+  (let* ((spec (assq action so-long-action-alist))
+         (enable (nth 2 spec))
+         (disable (nth 3 spec)))
+    (when enable
+      ;; An action is already active in the buffer: undo it first, as
+      ;; `so-long' does, so that the values remembered below are the real
+      ;; originals rather than the overridden ones.
+      (when so-long--active
+        (so-long-revert))
+      (setq-local so-long-action action
+                  so-long-function enable
+                  so-long-revert-function disable
+                  so-long-detected-p t)
+      (so-long-remember-all :reset)
+      (funcall enable)
+      (unless (derived-mode-p 'so-long-mode)
+        (setq so-long-mode-line-info (so-long-mode-line-info)))
+      ;; Set last: `so-long--active' is not permanent-local, and the action
+      ;; functions above must not see a half-applied state.
+      (setq so-long--active t)
+      (let ((inhibit-read-only t))
+        (run-hooks 'so-long-hook))
+      t)))
+
+(defun gptel-org--so-long-keep-mode (&rest _)
+  "Keep `so-long-mode' from replacing the major mode of a session buffer.
+
+This is a `:before-while' filter for `so-long-mode', which is the only
+way a major mode gets replaced.  In a session buffer it applies
+`gptel-org-so-long-action' instead, see `gptel-org--so-long-apply', and
+returns nil, so the advised mode function never runs.
+
+`so-long-mode' would cost the buffer its session: it calls
+`kill-all-local-variables', which turns off `gptel-mode' and with it
+the buffer-local `write-contents-functions' entry,
+`gptel--save-state', that writes the session state.  `so-long-revert'
+brings the original major mode back but not `gptel-mode', so the
+buffer would look like an ordinary Org file and silently stop saving
+its state.  Applying the configured action instead leaves the major
+mode and its local variables alone while still doing what
+`so-long-minor-mode' does: the variable overrides of
+`so-long-variable-overrides', the minor modes of `so-long-minor-modes'
+turned off, and fontification disabled.
+
+Return nil -- and thus keep `so-long-mode' from running -- only in a
+session buffer whose action was applied here.  Everywhere else return
+non-nil, so that `so-long-mode' runs as usual: in ordinary buffers, and
+in session buffers when `gptel-org-so-long-action' is nil, is
+`so-long-mode', or when the buffer is in `so-long-mode' already.  (A
+`:before-while' filter runs the advised function on any non-nil
+value.)"
+  (if (and gptel-org-so-long-action
+           (not (eq gptel-org-so-long-action 'so-long-mode))
+           (not (eq major-mode 'so-long-mode))
+           (gptel-org-session-p))
+      (progn
+        (with-demoted-errors "gptel-org: Could not apply the so-long action: %S"
+          (gptel-org--so-long-apply gptel-org-so-long-action))
+        ;; Dropped even if the action could not be applied: the major mode
+        ;; must not be replaced either way.
+        nil)
+    t))
+
 (defun gptel-org--so-long-setup ()
   "Keep `so-long' from replacing the major mode of the current buffer.
 
@@ -986,7 +1079,7 @@ Does nothing unless `gptel-org-so-long-action' is non-nil and `so-long'
 is available.  See that option for what the problem is and for the
 choice of action.
 
-Two separate things can be needed, and both use only the public API
+Three separate things are needed, and they use only the public API
 of `so-long':
 
 - If `so-long' has already acted and replaced the major mode with
@@ -998,15 +1091,28 @@ of `so-long':
   `so-long-revert-function' from the action it is given.
 
 - Either way, the action is then recorded in the buffer-local value of
-  `so-long-action', so a later automatic invocation of `so-long' in this
-  buffer uses it too.  This has to happen last: reverting to the
-  original major mode runs that mode, which kills all local variables,
-  so a buffer-local `so-long-action' set earlier would not survive."
+  `so-long-action', so that an invocation of `so-long' that does not
+  name an action uses it too.  This has to happen last: reverting to
+  the original major mode runs that mode, which kills all local
+  variables, so a buffer-local `so-long-action' set earlier would not
+  survive.
+
+- Recording the action is not enough on its own.  `so-long-action' is
+  not permanent-local, so any later major mode change loses it, and a
+  direct call to `so-long-mode' ignores it in any case.  The action is
+  therefore enforced from `so-long-mode' itself, with
+  `gptel-org--so-long-keep-mode'.  The advice is added here rather
+  than at load time so that it is in place whether or not
+  `gptel-org-so-long-action' was customized after gptel-org was
+  loaded."
   (when (and gptel-org-so-long-action (require 'so-long nil t))
     (when (eq major-mode 'so-long-mode)
       (so-long-revert)
       (so-long gptel-org-so-long-action))
-    (setq-local so-long-action gptel-org-so-long-action)))
+    (setq-local so-long-action gptel-org-so-long-action)
+    (unless (advice-member-p #'gptel-org--so-long-keep-mode 'so-long-mode)
+      (advice-add 'so-long-mode :before-while
+                  #'gptel-org--so-long-keep-mode))))
 
 (defvar gptel-org--in-find-file-setup nil
   "Non-nil while `gptel-org--find-file-setup' is running.

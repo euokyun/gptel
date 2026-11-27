@@ -91,6 +91,17 @@
 ** Notable bug fixes
 
 - Session state is now written at the very end of saving, after every
+- =so-long= can no longer replace the major mode of a gptel session
+  buffer, which used to cost the buffer its session: =so-long-mode= calls
+  =kill-all-local-variables=, turning off =gptel-mode= and with it the
+  buffer-local =write-contents-functions= entry that saves the session
+  state.  =so-long-revert= restored the original major mode but not
+  =gptel-mode=, so the buffer silently stopped saving its state.  The
+  action of =gptel-org-so-long-action= is now applied instead, which
+  keeps the major mode and applies the same performance measures.
+  =so-long= is only reachable automatically through =global-so-long-mode=,
+  so nothing changes for buffers it does not touch.
+
   member of ~before-save-hook~.  The state that gptel saves includes
   buffer positions, so anything that edits the buffer during saving --
   trimming trailing whitespace, inserting a table of contents -- used to
